@@ -1,0 +1,11 @@
+{
+  "name": "zclaude-monorepo",
+  "private": true,
+  "workspaces": ["packages/*", "playground"],
+  "scripts": {
+    "build": "make -C zclaude",
+    "test": "make -C zclaude test",
+    "test:integration": "bun test --timeout 240000 zclaude/tests",
+    "playground": "bun run --cwd playground start"
+  }
+}

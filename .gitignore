@@ -1,0 +1,5 @@
+node_modules/
+zclaude/bin/
+playground/dist/
+*.log
+.DS_Store

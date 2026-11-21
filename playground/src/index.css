@@ -1,0 +1,253 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import '@fontsource-variable/geist';
+@import '@fontsource-variable/geist-mono';
+@import '@xterm/xterm/css/xterm.css';
+
+/* shadcn/ui, neutral base color. Dark follows the system. */
+@custom-variant dark (@media (prefers-color-scheme: dark));
+
+:root {
+  --radius: 0.625rem;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  /* Two status colors the conversation needs beyond the shadcn set. */
+  --warning: oklch(0.666 0.179 58.318);
+  --success: oklch(0.627 0.194 149.214);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: oklch(0.145 0 0);
+    --foreground: oklch(0.985 0 0);
+    --card: oklch(0.205 0 0);
+    --card-foreground: oklch(0.985 0 0);
+    --popover: oklch(0.205 0 0);
+    --popover-foreground: oklch(0.985 0 0);
+    --primary: oklch(0.922 0 0);
+    --primary-foreground: oklch(0.205 0 0);
+    --secondary: oklch(0.269 0 0);
+    --secondary-foreground: oklch(0.985 0 0);
+    --muted: oklch(0.269 0 0);
+    --muted-foreground: oklch(0.708 0 0);
+    --accent: oklch(0.269 0 0);
+    --accent-foreground: oklch(0.985 0 0);
+    --destructive: oklch(0.704 0.191 22.216);
+    --border: oklch(1 0 0 / 10%);
+    --input: oklch(1 0 0 / 15%);
+    --ring: oklch(0.556 0 0);
+    --warning: oklch(0.769 0.188 70.08);
+    --success: oklch(0.723 0.219 149.579);
+  }
+}
+
+@theme inline {
+  --font-sans: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'Geist Mono Variable', ui-monospace, monospace;
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-warning: var(--warning);
+  --color-success: var(--success);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-background text-foreground overflow-hidden font-sans antialiased;
+  }
+  body.resizing {
+    cursor: col-resize;
+    user-select: none;
+  }
+}
+
+/* ── Conversation rows. Heights come from Mugen, so these only paint. ── */
+.thread {
+  height: 100%;
+}
+.user-row.pending {
+  opacity: 0.5;
+}
+.user-text {
+  overflow: hidden;
+}
+.user-text.clamped {
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 24px), transparent);
+}
+.caret {
+  animation: pulse 1.6s ease-in-out infinite;
+}
+.disclosure {
+  width: 100%;
+}
+.disclosure:hover span {
+  color: var(--foreground);
+}
+.disclosure:focus-visible,
+.user-toggle:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+.group-head {
+  display: block;
+  height: 100%;
+  padding: 2px;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.shimmer {
+  background: linear-gradient(100deg, var(--muted-foreground) 35%, var(--foreground) 50%, var(--muted-foreground) 65%) 0 0 / 220% 100%;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: shimmer 2.4s linear infinite;
+}
+.tool-card.error,
+.tool-card.error .tool-label {
+  color: var(--destructive);
+}
+.tool-card.waiting,
+.tool-card.waiting .tool-label {
+  color: var(--warning);
+}
+.tool-card.open .tool-chevron {
+  transform: rotate(90deg);
+}
+.tool-panel {
+  background: color-mix(in oklab, var(--muted) 60%, transparent);
+  border: 1px solid var(--border);
+  border-radius: calc(var(--radius) - 2px);
+  overflow: hidden;
+}
+.console-output {
+  border-top: 1px solid var(--border);
+}
+.diff-row {
+  color: var(--muted-foreground);
+}
+.diff-row.add {
+  color: var(--foreground);
+  background: color-mix(in oklab, var(--success) 14%, transparent);
+}
+.diff-row.del {
+  color: var(--foreground);
+  background: color-mix(in oklab, var(--destructive) 14%, transparent);
+}
+.diff-row.add .sign {
+  color: var(--success);
+}
+.diff-row.del .sign {
+  color: var(--destructive);
+}
+.diff-file {
+  background: var(--muted);
+}
+.plan-mark {
+  display: block;
+  width: 14px;
+  height: 14px;
+  margin-top: 3px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1.5px var(--border);
+}
+.plan-item.in_progress .plan-mark {
+  box-shadow: inset 0 0 0 1.5px var(--foreground);
+}
+.plan-item.completed .plan-mark {
+  background: var(--muted-foreground);
+  box-shadow: none;
+}
+.spinner {
+  flex: none;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 1.5px solid color-mix(in oklab, var(--foreground) 15%, transparent);
+  border-top-color: var(--foreground);
+  animation: spin 0.8s linear infinite;
+}
+#term .xterm,
+#term .xterm-viewport {
+  height: 100%;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes shimmer {
+  from {
+    background-position: 110% 0;
+  }
+  to {
+    background-position: -110% 0;
+  }
+}
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001s !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001s !important;
+  }
+  .shimmer {
+    -webkit-text-fill-color: currentColor;
+    background: none;
+  }
+}
