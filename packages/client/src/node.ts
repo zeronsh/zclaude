@@ -2,7 +2,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { readdirSync, statSync } from 'node:fs';
 import { connect as netConnect, type Socket } from 'node:net';
-import { homedir } from 'node:os';
+import { constants as osConstants, homedir } from 'node:os';
 import { join } from 'node:path';
 import { Peer } from './peer.ts';
 import type { DialogResponse, Key, PermissionMode, Snapshot } from './protocol.ts';
@@ -26,15 +26,25 @@ export interface SpawnOptions {
 export class ZClaude extends Peer {
   /** The snapshot from `ready` (spawned) or from the first `status` (attached). */
   ready: Promise<Snapshot>;
-  /** Resolves with the exit code once the session is gone. */
-  exited: Promise<number>;
+  /**
+   * Resolves when this connection ends: with Claude's exit code (128 + n for signal
+   * n) if the session ended, or null if this consumer detached or lost the socket.
+   */
+  exited: Promise<number | null>;
+  /** The `exit` event's signal name, once the session has ended by a signal. */
+  exitSignal?: string;
   child?: ChildProcess;
   #socket?: Socket;
+  #exitCode: number | null = null;
 
   private constructor(write: (line: string) => void) {
     super(write);
     this.ready = Promise.resolve(undefined as unknown as Snapshot);
-    this.exited = Promise.resolve(0);
+    this.exited = Promise.resolve(null);
+    this.on('exit', (params) => {
+      this.#exitCode = params.code;
+      this.exitSignal = params.signal;
+    });
   }
 
   /** Starts `zclaude --stdio`: Claude Code runs headless and this process owns it. */
@@ -49,15 +59,20 @@ export class ZClaude extends Peer {
       env: { ...process.env, ...options.env },
       stdio: ['pipe', 'pipe', 'inherit'],
     });
-    const session = new ZClaude((line) => child.stdin!.write(`${line}\n`));
+    const session = new ZClaude((line) => {
+      if (child.stdin!.writable) child.stdin!.write(`${line}\n`);
+    });
     session.child = child;
+    child.stdin!.on('error', () => {}); // zclaude went away; `exited` reports it.
+    child.once('spawn', () => session.markOpen());
     child.stdout!.setEncoding('utf8');
     child.stdout!.on('data', (chunk: string) => session.feed(chunk));
     session.ready = session.waitFor('ready', () => true, 60_000).then((params) => params.snapshot);
     session.exited = new Promise((resolve) => {
       child.on('exit', (code, signal) => {
         session.close('zclaude exited');
-        resolve(code ?? (signal ? 128 : 1));
+        // zclaude exits with Claude's code; a signal here means zclaude itself was killed.
+        resolve(code ?? 128 + (signal ? (osConstants.signals as Record<string, number>)[signal] ?? 0 : 0));
       });
       child.on('error', (error) => {
         session.close(String(error));
@@ -76,14 +91,20 @@ export class ZClaude extends Peer {
       socket.once('connect', resolve);
       socket.once('error', reject);
     });
-    const session = new ZClaude((line) => socket.write(`${line}\n`));
+    const session = new ZClaude((line) => {
+      if (!socket.destroyed) socket.write(`${line}\n`);
+    });
     session.#socket = socket;
     socket.setEncoding('utf8');
     socket.on('data', (chunk: string) => session.feed(chunk));
-    session.exited = new Promise((resolve) => socket.on('close', () => {
-      session.close('socket closed');
-      resolve(0);
-    }));
+    socket.on('error', () => {}); // `close` follows, and `exited` reports it.
+    session.exited = new Promise((resolve) =>
+      socket.on('close', () => {
+        session.close('socket closed');
+        resolve(session.#exitCode);
+      }),
+    );
+    session.markOpen();
     session.ready = session.call('status');
     return session;
   }
@@ -142,17 +163,28 @@ export class ZClaude extends Peer {
     return this.call('term.write', { data: Buffer.from(bytes).toString('base64') });
   }
 
-  /** Ends the session (headless) or detaches (socket). */
-  async shutdown(): Promise<number> {
-    if (this.#socket) {
-      this.#socket.end();
-      return this.exited;
-    }
-    await this.call('shutdown').catch(() => {});
-    const timer = setTimeout(() => this.child?.kill('SIGKILL'), 10_000);
+  /**
+   * Ends the session the way a person would (the turn stops, open dialogs are
+   * refused, /exit is typed) and resolves with Claude's exit code. zclaude falls
+   * back to SIGHUP and then SIGKILL; `force` starts at SIGHUP.
+   */
+  async shutdown(options: { force?: boolean } = {}): Promise<number | null> {
+    if (this.closed) return this.exited;
+    await this.call('shutdown', { force: options.force }).catch(() => {});
+    // zclaude escalates by itself. This only covers a zclaude that is itself stuck.
+    const timer = setTimeout(() => this.child?.kill('SIGKILL'), 20_000);
     const code = await this.exited;
     clearTimeout(timer);
     return code;
+  }
+
+  /**
+   * Closes this connection. Over a socket the session carries on. A spawned session
+   * loses its owner, so zclaude shuts it down as `shutdown()` would.
+   */
+  detach(): void {
+    if (this.#socket) this.#socket.end();
+    else this.child?.stdin?.end();
   }
 }
 
@@ -165,9 +197,12 @@ export function liveSockets(): string[] {
   } catch {
     return [];
   }
-  return names
-    .map((name) => join(dir, name))
-    .map((path) => ({ path, time: statSync(path).mtimeMs }))
-    .sort((a, b) => b.time - a.time)
-    .map((item) => item.path);
+  const found: Array<{ path: string; time: number }> = [];
+  for (const name of names) {
+    const path = join(dir, name);
+    try {
+      found.push({ path, time: statSync(path).mtimeMs });
+    } catch {} // removed as its session ended
+  }
+  return found.sort((a, b) => b.time - a.time).map((item) => item.path);
 }

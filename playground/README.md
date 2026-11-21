@@ -5,10 +5,13 @@ Claude Code terminal on the right. It is only a consumer of zclaude. It talks to
 `zclaude --stdio` through `@zclaude/client`, and zclaude itself is unchanged and
 doesn't need it.
 
+From the repo root:
+
 ```
-bun install                 # at the repo root
-make -C ../zclaude          # builds ../zclaude/bin/zclaude
-bun run build               # the frontend, into dist/
+bun install                       # every workspace
+make -C zclaude                   # zclaude/bin/zclaude
+cd playground
+bun run build                     # the frontend, into dist/
 bun server.ts --port 7777 --cwd ~/some/project -- --model haiku
 ```
 
@@ -27,10 +30,12 @@ It prints `http://127.0.0.1:7777/?t=TOKEN`. Open that URL.
 ## How it works
 
 - **Server (`server.ts`):** spawns `zclaude --stdio` and subscribes with `term: true`.
-  zclaude stores nothing, so storage is the server's own choice. It keeps every event
-  except terminal output in memory and replays them to each browser that connects, so a
-  reload rebuilds the whole conversation. The terminal is redrawn from
-  `screen({ ansi: true })` instead, then follows live output.
+  zclaude stores nothing, so storage is the server's own choice. It folds events into
+  one `SessionStore`, bounded to the last 5000 entries, with streamed text dropped
+  once the transcript holds it. Each browser that connects gets that state, then live
+  events, so a reload rebuilds the conversation and memory stays bounded however long
+  the session runs. The terminal is redrawn from `screen({ ansi: true })` instead,
+  then follows live output.
 - **One WebSocket (`/ws`):** carries events, terminal bytes and RPC. Browsers may call
   only the public methods (`prompt.send`, `command`, `interrupt`, `dialog.respond`,
   `model.set`, `mode.set`, `keys`, `term.write`, `term.resize`, `screen`, `status`,
@@ -42,7 +47,9 @@ It prints `http://127.0.0.1:7777/?t=TOKEN`. Open that URL.
   - `src/model.ts` turns that view into rows. `src/rows.tsx` draws them in a Mugen
     `MugenVList`, so every row height is computed. The list sticks to the bottom, and its
     runway lets the latest prompt reach the top.
-  - `src/dock.tsx` answers questions, permissions, plans and MCP elicitations.
+  - `src/dock.tsx` answers questions, permissions, plans (rendered as markdown, with
+    the terminal card's own choices), MCP elicitations, and any other card the
+    terminal shows.
 - **Security:** this page hands out a shell-equivalent terminal. The server binds to
   127.0.0.1, and every route needs the token, from the URL or from the cookie the page
   sets. Treat the URL like a password.

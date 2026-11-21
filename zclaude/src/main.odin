@@ -3,11 +3,22 @@ package zclaude
 // zclaude: run the interactive Claude Code CLI unchanged and drive it from outside.
 //
 //   zclaude [claude args]            use it exactly like `claude`; a control socket opens
+//                                    at ~/.zclaude/run/<pid>.sock (or --socket PATH)
 //   zclaude --stdio [claude args]    headless: JSON-RPC on stdin/stdout, no terminal needed
 //   zclaude ctl <command>            talk to a running session
 //
 // Subcommands, `--version`, `-p` and non-terminal use (without --stdio) go straight
 // to the real binary.
+//
+// The protocol is JSON-RPC 2.0, one object per line. Methods: status, subscribe,
+// unsubscribe, prompt.send, command, interrupt, dialog.respond, model.set, mode.set,
+// keys, term.write, term.resize, screen, memory, shutdown. Events (notifications,
+// params start with `seq`): ready, state, meta, hook, prompt, entry, stream.start,
+// stream.block, stream.delta, stream.block_stop, stream.stop_reason, stream.end,
+// stream.confirmed, dialog.open, dialog.update, term.output, term.resize, exit.
+// Dialog kinds: question, permission, plan, elicitation, terminal. Nothing is
+// stored: consumers keep what they want. The README documents every field, and
+// packages/client/src/protocol.ts types them; keep all three in step.
 
 import "core:c"
 import "core:fmt"
@@ -17,7 +28,7 @@ import "core:strings"
 import "core:sys/posix"
 
 AGENT_JS :: #load("agent.js", string)
-VERSION :: "0.2.0"
+VERSION :: "0.3.0"
 
 SUBCOMMANDS :: []string {
 	"agents", "attach", "auth", "auto-mode", "doctor", "gateway", "import", "install", "logs", "mcp", "plugin",
@@ -495,7 +506,8 @@ stdio_signal :: proc(sig: int) {
 	case SIGCHLD:
 		reap_child(false)
 	case SIGTERM, SIGHUP, SIGINT:
-		if !app.child_exited do c_kill(app.child_pid, SIGHUP)
+		// Graceful first; each further signal skips ahead a stage.
+		begin_shutdown()
 	}
 }
 
@@ -513,10 +525,12 @@ reap_child :: proc(job_control: bool) {
 			}
 			continue
 		}
-		code := 0
-		if w_status_exited(status) do code = w_status_code(status)
-		else if w_status_signaled(status) do code = 128 + w_status_signal(status)
-		hub_on_child_exit(code)
+		if w_status_signaled(status) {
+			sig := w_status_signal(status)
+			hub_on_child_exit(128 + sig, sig)
+		} else {
+			hub_on_child_exit(w_status_code(status))
+		}
 		return
 	}
 }
@@ -644,7 +658,13 @@ run_session :: proc(args: []string) -> int {
 			return 1
 		}
 		if w_status_exited(status) do return w_status_code(status)
-		if w_status_signaled(status) do return 128 + w_status_signal(status)
+		if w_status_signaled(status) {
+			// Dies the same way, so the wrapper can report the signal.
+			sig := c.int(w_status_signal(status))
+			c_signal(sig, SIG_DFL)
+			c_raise(sig)
+			return 128 + int(sig)
+		}
 		if w_status_stopped(status) {
 			c_raise(SIGSTOP)
 			c_tcsetpgrp(0, pid)

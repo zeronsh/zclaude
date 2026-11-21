@@ -1,6 +1,6 @@
 {
   "name": "@zclaude/client",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Client for zclaude's JSON-RPC protocol: spawn a headless session or attach to a running one",
   "type": "module",
   "exports": {
@@ -8,5 +8,7 @@
     "./protocol": "./src/protocol.ts",
     "./store": "./src/store.ts"
   },
-  "files": ["src"]
+  "files": [
+    "src"
+  ]
 }

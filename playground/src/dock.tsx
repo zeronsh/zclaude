@@ -1,8 +1,10 @@
 // Dialogs waiting on a person, docked above the composer so they stay in view
 // however far the conversation has scrolled. Each answer goes to zclaude as
 // `dialog.respond`; the terminal shows the same dialog, and whoever answers first wins.
+import type { DialogKind, DialogResponseFor, PlanMode } from '@zclaude/client/protocol';
 import type { DialogView } from '@zclaude/client/store';
-import { ShieldAlert, MessageCircleQuestion, ClipboardList, Plug } from 'lucide-react';
+import { Markdown } from '@wingleeio/mugen-markdown';
+import { ShieldAlert, MessageCircleQuestion, ClipboardList, Plug, SquareTerminal } from 'lucide-react';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Badge } from './components/ui/badge.tsx';
 import { Button } from './components/ui/button.tsx';
@@ -14,6 +16,7 @@ import { RadioGroup, RadioGroupItem } from './components/ui/radio-group.tsx';
 import { Textarea } from './components/ui/textarea.tsx';
 import { OPEN_DIALOG } from './model.ts';
 import { rpc } from './net.ts';
+import { CARD_THEME } from './rows.tsx';
 import { unwrapShell } from './tools.ts';
 
 interface Question {
@@ -33,14 +36,14 @@ interface CardProps {
   active: boolean;
 }
 
-function useRespond(id: string): { send: (response: Record<string, unknown>) => Promise<void>; error: string; busy: boolean } {
+function useRespond<K extends DialogKind>(id: string, _kind: K): { send: (response: DialogResponseFor<K>) => Promise<void>; error: string; busy: boolean } {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const send = async (response: Record<string, unknown>) => {
+  const send = async (response: DialogResponseFor<K>) => {
     setError('');
     setBusy(true);
     try {
-      await rpc('dialog.respond', { id, ...response } as any);
+      await rpc('dialog.respond', { id, ...response });
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -75,7 +78,8 @@ function useCardKeys(active: boolean, keys: { enter?: () => void; escape?: () =>
 }
 
 function Status({ dialog, error }: { dialog: DialogView; error: string }): ReactNode {
-  const text = error || (!dialog.held ? 'Answer this one in the terminal.' : dialog.touched ? 'Someone is typing in the terminal.' : '');
+  const text =
+    error || (!dialog.held && dialog.kind !== 'terminal' ? 'Answer this one in the terminal.' : dialog.touched ? 'Someone is typing in the terminal.' : '');
   if (!text) return null;
   return <span className={error ? 'text-destructive text-xs' : 'text-muted-foreground text-xs'}>{text}</span>;
 }
@@ -87,7 +91,7 @@ function Kbd({ children }: { children: ReactNode }): ReactNode {
 function QuestionCard({ dialog, active }: CardProps): ReactNode {
   const questions: Question[] = dialog.input?.questions ?? [];
   const [answers, setAnswers] = useState<Answer[]>(() => questions.map(() => ({ selected: [], other: '' })));
-  const { send, error, busy } = useRespond(dialog.id);
+  const { send, error, busy } = useRespond(dialog.id, 'question');
   const blocked = !active || busy || !dialog.held;
   const instant = questions.length === 1 && !questions[0]?.multiSelect;
   const submit = (value = answers) => send({ answers: value });
@@ -204,7 +208,7 @@ function preview(input: any): string {
 }
 
 function PermissionCard({ dialog, active }: CardProps): ReactNode {
-  const { send, error, busy } = useRespond(dialog.id);
+  const { send, error, busy } = useRespond(dialog.id, 'permission');
   const [message, setMessage] = useState('');
   const blocked = !active || busy || !dialog.held;
   const canAlways = Array.isArray(dialog.suggestions) && dialog.suggestions.length > 0;
@@ -242,18 +246,27 @@ function PermissionCard({ dialog, active }: CardProps): ReactNode {
   );
 }
 
-const PLAN_MODES = [
-  { value: 'default', label: 'Approve' },
-  { value: 'acceptEdits', label: 'Approve, accept edits' },
-  { value: 'auto', label: 'Approve, auto mode' },
-] as const;
+// The terminal card's wording for each choice, so both read the same.
+const PLAN_CHOICES: Record<PlanMode, string> = {
+  auto: 'Yes, and use auto mode',
+  acceptEdits: 'Yes, auto-accept edits',
+  default: 'Yes, manually approve edits',
+  bypassPermissions: 'Yes, and bypass permissions',
+  dontAsk: "Yes, and don't ask",
+};
 
 function PlanCard({ dialog, active }: CardProps): ReactNode {
-  const { send, error, busy } = useRespond(dialog.id);
+  const { send, error, busy } = useRespond(dialog.id, 'plan');
   const [feedback, setFeedback] = useState('');
   const blocked = !active || busy || !dialog.held;
-  const reject = () => send(feedback.trim() ? { decision: 'reject', message: feedback.trim() } : { decision: 'reject' });
-  useCardKeys(active && !blocked, { enter: () => void send({ decision: 'approve', mode: 'default' }), escape: () => void reject() });
+  const message = feedback.trim() || undefined;
+  // Until the card is drawn its choices aren't known; approving then keeps the mode
+  // the session had before plan mode.
+  const modes: Array<PlanMode | undefined> = dialog.modes?.length ? dialog.modes : [undefined];
+  // As on the terminal, feedback can go with an approval too.
+  const approve = (mode?: PlanMode) => send({ decision: 'approve', mode, message });
+  const reject = () => send({ decision: 'reject', message });
+  useCardKeys(active && !blocked, { enter: () => void approve(modes[0]), escape: () => void reject() });
   return (
     <Card className="gap-3" hidden={!active}>
       <CardHeader>
@@ -262,19 +275,21 @@ function PlanCard({ dialog, active }: CardProps): ReactNode {
           Claude has a plan
         </CardTitle>
       </CardHeader>
-      <CardContent className="flex flex-col gap-2">
-        <pre className="bg-muted max-h-64 overflow-auto rounded-md p-3 font-sans text-sm whitespace-pre-wrap">{String(dialog.input?.plan ?? '')}</pre>
-        <Textarea placeholder="Feedback, if rejecting (optional)" className="min-h-10" value={feedback} disabled={blocked} onChange={(event) => setFeedback(event.target.value)} />
+      <CardContent className="flex flex-col gap-3">
+        <div className="max-h-80 overflow-auto rounded-md border p-3">
+          <Markdown source={String(dialog.input?.plan ?? '')} theme={CARD_THEME} />
+        </div>
+        <Textarea placeholder="Tell Claude what to change" className="min-h-10" value={feedback} disabled={blocked} onChange={(event) => setFeedback(event.target.value)} />
       </CardContent>
       <CardFooter className="flex-wrap">
-        {PLAN_MODES.map((mode, i) => (
-          <Button key={mode.value} size="sm" variant={i === 0 ? 'default' : 'secondary'} disabled={blocked} onClick={() => void send({ decision: 'approve', mode: mode.value })}>
-            {mode.label}
+        {modes.map((mode, i) => (
+          <Button key={mode ?? 'approve'} size="sm" variant={i === 0 ? 'default' : 'secondary'} disabled={blocked} onClick={() => void approve(mode)}>
+            {mode ? PLAN_CHOICES[mode] : 'Approve'}
             {i === 0 ? <Kbd>⏎</Kbd> : null}
           </Button>
         ))}
         <Button size="sm" variant="outline" disabled={blocked} onClick={() => void reject()}>
-          Keep planning <Kbd>esc</Kbd>
+          {message ? 'Send feedback' : 'Keep planning'} <Kbd>esc</Kbd>
         </Button>
         <Status dialog={dialog} error={error} />
       </CardFooter>
@@ -283,7 +298,7 @@ function PlanCard({ dialog, active }: CardProps): ReactNode {
 }
 
 function ElicitationCard({ dialog, active }: CardProps): ReactNode {
-  const { send, error, busy } = useRespond(dialog.id);
+  const { send, error, busy } = useRespond(dialog.id, 'elicitation');
   const properties: Record<string, any> = dialog.input?.requested_schema?.properties ?? {};
   const [values, setValues] = useState<Record<string, string>>({});
   const blocked = !active || busy || !dialog.held;
@@ -337,6 +352,44 @@ function ElicitationCard({ dialog, active }: CardProps): ReactNode {
   );
 }
 
+/** A card on the terminal that no hook describes, answered by choice number. */
+function TerminalCard({ dialog, active }: CardProps): ReactNode {
+  const { send, error, busy } = useRespond(dialog.id, 'terminal');
+  const options: string[] = dialog.input?.options ?? [];
+  const blocked = !active || busy;
+  useCardKeys(active && !blocked, {
+    escape: () => void send({ decision: 'cancel' }),
+    digit: (n) => {
+      if (n <= options.length) void send({ option: n });
+    },
+  });
+  return (
+    <Card className="gap-3" hidden={!active}>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <SquareTerminal className="size-4" />
+          The terminal is asking
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        <pre className="bg-muted max-h-64 overflow-auto rounded-md p-3 font-mono text-xs whitespace-pre-wrap">{String(dialog.input?.text ?? '')}</pre>
+      </CardContent>
+      <CardFooter className="flex-wrap">
+        {options.map((label, i) => (
+          <Button key={i} size="sm" variant={i === 0 ? 'default' : 'secondary'} disabled={blocked} onClick={() => void send({ option: i + 1 })}>
+            {label}
+            <Kbd>{i + 1}</Kbd>
+          </Button>
+        ))}
+        <Button size="sm" variant="outline" disabled={blocked} onClick={() => void send({ decision: 'cancel' })}>
+          Cancel <Kbd>esc</Kbd>
+        </Button>
+        <Status dialog={dialog} error={error} />
+      </CardFooter>
+    </Card>
+  );
+}
+
 export function Dock({ dialogs }: { dialogs: Record<string, DialogView> }): ReactNode {
   const open = Object.values(dialogs)
     .filter((dialog) => OPEN_DIALOG.has(dialog.status))
@@ -362,6 +415,8 @@ export function Dock({ dialogs }: { dialogs: Record<string, DialogView> }): Reac
             return <PlanCard key={dialog.id} {...props} />;
           case 'elicitation':
             return <ElicitationCard key={dialog.id} {...props} />;
+          case 'terminal':
+            return <TerminalCard key={dialog.id} {...props} />;
           default:
             return <PermissionCard key={dialog.id} {...props} />;
         }

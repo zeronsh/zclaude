@@ -18,7 +18,7 @@ const entry = (uuid: string, role: string, origin: string, blocks: unknown[], ex
   ...extra,
 });
 
-const dialog = (id: string, kind: DialogView['kind'], status: string, extra: Partial<DialogView> = {}): DialogView => ({
+const dialog = (id: string, kind: DialogView['kind'], status: DialogView['status'], extra: Partial<DialogView> = {}): DialogView => ({
   id,
   kind,
   tool: kind === 'question' ? 'AskUserQuestion' : 'Bash',

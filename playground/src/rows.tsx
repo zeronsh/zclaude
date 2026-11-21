@@ -96,6 +96,17 @@ const CHAT_THEME: DeepPartial<MarkdownTheme> = {
   rule: { color: INK.hairline },
 };
 
+/** For a plan on its approval card: the chat's look, a size down. */
+export const CARD_THEME: DeepPartial<MarkdownTheme> = {
+  ...CHAT_THEME,
+  fontSize: 14,
+  lineHeight: 22,
+  blockGap: 10,
+  heading: { color: INK.fg, weight: 600, sizes: { 1: 18, 2: 16, 3: 15, 4: 14, 5: 14, 6: 14 }, lineHeights: { 1: 26, 2: 24, 3: 22, 4: 22, 5: 22, 6: 22 } },
+  code: { ...CHAT_THEME.code, padding: 10, fontSize: 12.5, lineHeight: 19, header: { show: false } },
+  list: { gap: 6, indent: 20, markerColor: INK.muted },
+};
+
 export const REASONING_THEME: DeepPartial<MarkdownTheme> = {
   fontFamily: SANS_FAMILY,
   monoFamily: MONO,

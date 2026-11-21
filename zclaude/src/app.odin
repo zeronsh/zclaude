@@ -14,7 +14,6 @@ import "core:time"
 PROTOCOL_VERSION :: 1
 // A consumer this far behind is dropped rather than letting memory grow forever.
 MAX_CLIENT_BACKLOG :: 64 * 1024 * 1024
-TRANSCRIPT_POLL_MS :: 100
 
 Mode :: enum {
 	Interactive,
@@ -49,9 +48,12 @@ Client :: struct {
 
 Timer_Kind :: enum {
 	Input,       // write `data` to Claude, through the agent or the PTY
+	Enter,       // submit a typed prompt, unless a card has opened over it
 	Enter_Retry, // resend Enter until UserPromptSubmit confirms a prompt
 	Mode_Step,   // one step of cycling the permission mode with Shift+Tab
 	Memory_Timeout,
+	Settle,      // an answered card's wait for Claude Code to take it down ran out
+	Shutdown,    // the next step of a graceful shutdown
 }
 
 Input_Route :: enum {
@@ -77,6 +79,8 @@ App :: struct {
 	child_pid:     c.int,
 	child_exited:  bool,
 	exit_code:     int,
+	exit_signal:   int, // the signal that ended Claude, 0 if it exited by itself
+	shutdown:      Shutdown,
 	pty_wbuf:      [dynamic]u8,
 	pty_woff:      int,
 	clients:       [dynamic]^Client,
@@ -93,6 +97,22 @@ App :: struct {
 }
 
 app: App
+
+Shutdown_Stage :: enum {
+	None,
+	Graceful, // ending the turn and typing /exit
+	Hangup,   // SIGHUP sent
+	Killed,   // SIGKILL sent
+}
+
+Shutdown :: struct {
+	stage:     Shutdown_Stage,
+	hup_at:    i64, // when the graceful stage gives up
+	kill_at:   i64,
+	esc_at:    i64,
+	exit_at:   i64, // when /exit was typed
+	exits:     int,
+}
 
 now_ms :: proc() -> i64 {
 	return time.tick_now()._nsec / 1_000_000
@@ -386,7 +406,9 @@ loop_run :: proc(hooks: Loop_Hooks) {
 			}
 		}
 
-		timeout: i64 = TRANSCRIPT_POLL_MS
+		timeout := max(app.last_poll + transcript_interval() - now_ms(), 0)
+		// A changed screen is read again shortly (mode, plan choices), even if idle.
+		if app.hub.screen_dirty do timeout = min(timeout, max(app.hub.screen_checked_at + SCREEN_CHECK_MS - now_ms(), 0))
 		if nt := next_timer_ms(); nt >= 0 do timeout = min(timeout, max(nt - now_ms(), 0))
 		if exit_deadline >= 0 do timeout = min(timeout, max(exit_deadline - now_ms(), 0))
 		n := c_poll(raw_data(fds), c.uint(len(fds)), c.int(timeout))
@@ -459,7 +481,7 @@ loop_run :: proc(hooks: Loop_Hooks) {
 		}
 
 		run_due_timers()
-		if now_ms() - app.last_poll >= TRANSCRIPT_POLL_MS {
+		if now_ms() - app.last_poll >= transcript_interval() {
 			app.last_poll = now_ms()
 			hub_poll_transcript()
 		}

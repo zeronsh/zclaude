@@ -419,10 +419,44 @@ questions_answer_with_updated_input_and_prompts_wait_for_dialogs :: proc(t: ^tes
 	output, _ := parse_json(jstr(drain(hook)[0], "result", "output"))
 	testing.expect_value(t, jstr(output, "hookSpecificOutput", "decision", "updatedInput", "answers", "Color?"), "Green")
 	testing.expect_value(t, len(jarr(output, "hookSpecificOutput", "decision", "updatedInput", "questions")), 1)
+	// The card is still on screen until Claude Code takes it down, so typing waits
+	// for the tool to report back.
+	flush_inproc_queue()
+	testing.expect_value(t, p.status, "queued")
+	hook_event(`{"hook_event_name":"PostToolUse","tool_name":"AskUserQuestion","tool_use_id":"q1","tool_input":{}}`)
 	flush_inproc_queue()
 	testing.expect_value(t, p.status, "delivered")
 	msgs := drain(cap)
 	testing.expect_value(t, jstr(events_of(msgs, "dialog.update")[0], "answers", "Color?"), "Green")
+}
+
+@(test)
+typing_waits_out_a_card_that_never_reports_back :: proc(t: ^testing.T) {
+	reset_app()
+	hook := capture(subscribed = false)
+	hook_event(`{"hook_event_name":"SessionStart"}`)
+	req, _ := parse_json(`{"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"ls"}}`)
+	hub_on_permission_request(hook.cl, "1", req)
+	p, _ := hub_send_prompt("next", "inproc")
+	allow, _ := parse_json(`{"id":"perm-1","decision":"allow"}`)
+	_, err := rpc_dialog_respond(allow)
+	testing.expect_value(t, err, "")
+	flush_inproc_queue()
+	testing.expect_value(t, p.status, "queued")
+	st := hub().settle.?
+	hub().settle = Settle{id = st.id, tool = st.tool, kind = st.kind, until = now_ms() - 1}
+	flush_inproc_queue()
+	testing.expect_value(t, p.status, "delivered")
+	// The same holds for an Enter: a card that opens after the paste keeps it back.
+	hook2 := capture(subscribed = false)
+	hub_on_permission_request(hook2.cl, "2", req)
+	enter_timers := 0
+	for tm in app.timers do if tm.kind == .Enter do enter_timers += 1
+	testing.expect_value(t, enter_timers, 1)
+	for tm in app.timers do if tm.kind == .Enter do hub_on_timer(tm)
+	held := 0
+	for tm in app.timers do if tm.kind == .Enter && tm.n == 1 do held += 1
+	testing.expect_value(t, held, 1)
 }
 
 @(test)
@@ -455,24 +489,148 @@ plan_approval_sets_the_mode_and_interrupt_refuses_held_dialogs :: proc(t: ^testi
 	req, _ := parse_json(`{"hook_event_name":"PermissionRequest","tool_name":"ExitPlanMode","tool_input":{"plan":"x"}}`)
 	hub_on_permission_request(hook.cl, "1", req)
 	testing.expect_value(t, hub().dialogs[0].kind, "plan")
-	approve, _ := parse_json(`{"id":"p1","decision":"approve","mode":"acceptEdits"}`)
-	_, err := rpc_dialog_respond(approve)
+	// bypassPermissions only when the card offers it.
+	bypass, _ := parse_json(`{"id":"p1","decision":"approve","mode":"bypassPermissions"}`)
+	_, berr := rpc_dialog_respond(bypass)
+	testing.expect(t, berr != "")
+	approve, _ := parse_json(`{"id":"p1","decision":"approve","mode":"acceptEdits","plan":"y","message":"also add tests"}`)
+	res, err := rpc_dialog_respond(approve)
 	testing.expect_value(t, err, "")
 	output, _ := parse_json(jstr(drain(hook)[0], "result", "output"))
 	perm := jarr(output, "hookSpecificOutput", "decision", "updatedPermissions")[0]
 	testing.expect_value(t, jstr(perm, "type"), "setMode")
 	testing.expect_value(t, jstr(perm, "mode"), "acceptEdits")
+	// ExitPlanMode needs a person, so Claude Code only takes an allow that carries the
+	// input. An edited plan goes back the same way.
+	testing.expect_value(t, jstr(output, "hookSpecificOutput", "decision", "updatedInput", "plan"), "y")
+	// Feedback follows as a prompt, once the card has gone.
+	reply, _ := parse_json(res)
+	testing.expect_value(t, jstr(reply, "mode"), "acceptEdits")
+	testing.expect(t, jstr(reply, "prompt_id") != "")
+	testing.expect_value(t, hub().inproc_queue[0].text, "also add tests")
 
 	hook2 := capture(subscribed = false)
 	hook_event(`{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"b2","tool_input":{"command":"rm x"}}`)
 	req2, _ := parse_json(`{"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"rm x"}}`)
 	hub_on_permission_request(hook2.cl, "2", req2)
-	res := rpc_interrupt()
-	testing.expect(t, strings.contains(res, `"dialog"`))
+	ires := rpc_interrupt()
+	testing.expect(t, strings.contains(ires, `"dialog"`))
 	out2, _ := parse_json(jstr(drain(hook2)[0], "result", "output"))
 	testing.expect_value(t, jstr(out2, "hookSpecificOutput", "decision", "behavior"), "deny")
 	testing.expect(t, jbool(out2, "hookSpecificOutput", "decision", "interrupt"))
 	testing.expect_value(t, len(hub().dialogs), 0)
+}
+
+@(test)
+plan_modes_come_from_the_card_on_screen :: proc(t: ^testing.T) {
+	reset_app()
+	screen_feed(app.screen, transmute([]u8)string("Plan\r\n 1. Write the file\r\n 2. Check it\r\nWould you like to proceed?\r\n \u276f 1. Yes, and use auto mode\r\n   2. Yes, manually approve edits\r\n   3. Tell Claude what to change\r\n      shift+tab to approve with this feedback\r\n"))
+	modes := plan_modes_on_screen(app.screen)
+	testing.expect_value(t, len(modes), 2)
+	testing.expect_value(t, modes[0], "auto")
+	testing.expect_value(t, modes[1], "default")
+
+	hook := capture(subscribed = false)
+	cap := capture()
+	hook_event(`{"hook_event_name":"PreToolUse","tool_name":"ExitPlanMode","tool_use_id":"p1","tool_input":{"plan":"x"}}`)
+	req, _ := parse_json(`{"hook_event_name":"PermissionRequest","tool_name":"ExitPlanMode","tool_input":{"plan":"x"}}`)
+	hub_on_permission_request(hook.cl, "1", req)
+	hub().screen_dirty = true
+	hub_after_tick()
+	update := events_of(drain(cap), "dialog.update")
+	testing.expect_value(t, len(update), 1)
+	testing.expect_value(t, len(jarr(update[0], "modes")), 2)
+	// Approving without a mode takes the card's first choice, as Enter would.
+	approve, _ := parse_json(`{"id":"p1","decision":"approve"}`)
+	res, err := rpc_dialog_respond(approve)
+	testing.expect_value(t, err, "")
+	testing.expect(t, strings.contains(res, `"mode":"auto"`))
+	output, _ := parse_json(jstr(drain(hook)[0], "result", "output"))
+	testing.expect_value(t, jstr(jarr(output, "hookSpecificOutput", "decision", "updatedPermissions")[0], "mode"), "auto")
+}
+
+@(test)
+nothing_is_typed_over_a_card_on_screen :: proc(t: ^testing.T) {
+	reset_app()
+	app.child_pid = 999_999_999
+	hook_event(`{"hook_event_name":"SessionStart"}`)
+	// A draft in the prompt box that looks like a list is not a card: the footer shows.
+	screen_feed(app.screen, transmute([]u8)string("\x1b[20;1H\u276f 1. first\r\n  2. second\x1b[24;1H  ? for shortcuts"))
+	testing.expect(t, !card_on_screen(app.screen))
+	// A card with no hook behind it, as Claude Code draws one.
+	screen_feed(app.screen, transmute([]u8)string("\x1b[2J\x1b[HWould you like to proceed?\r\n \u276f 1. Yes, and use auto mode\r\n   2. Yes, manually approve edits\r\n   3. Tell Claude what to change\r\n"))
+	testing.expect(t, card_on_screen(app.screen))
+	p, _ := hub_send_prompt("hello", "inproc")
+	testing.expect_value(t, p.status, "queued")
+	// Shutdown refuses it with Esc rather than typing /exit into it.
+	begin_shutdown()
+	testing.expect(t, app.shutdown.esc_at != 0)
+	testing.expect_value(t, app.shutdown.exits, 0)
+	screen_feed(app.screen, transmute([]u8)string("\x1b[2J\x1b[22;1H\u276f \x1b[24;1H  ? for shortcuts"))
+	testing.expect(t, !card_on_screen(app.screen))
+	shutdown_step()
+	testing.expect_value(t, app.shutdown.exits, 1)
+}
+
+@(test)
+a_card_without_a_hook_becomes_a_terminal_dialog :: proc(t: ^testing.T) {
+	reset_app()
+	cap := capture()
+	hook_event(`{"hook_event_name":"SessionStart"}`)
+	screen_feed(app.screen, transmute([]u8)string("Earlier output\x1b[10;1H\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\r\n Select model\r\n \u276f 1. Default      Opus 5.5\r\n   2. Opus         Opus 5.5\r\n   3. Haiku        Haiku 5.5\r\n"))
+	hub().screen_dirty = true
+	hub_after_tick()
+	// Not yet: a hook usually describes a card, and gets a moment to.
+	testing.expect_value(t, len(hub().dialogs), 0)
+	hub().card_since -= CARD_GRACE_MS
+	hub().screen_dirty = true
+	hub().screen_checked_at = 0
+	hub_after_tick()
+	opened := events_of(drain(cap), "dialog.open")
+	testing.expect_value(t, len(opened), 1)
+	testing.expect_value(t, jstr(opened[0], "kind"), "terminal")
+	testing.expect_value(t, len(jarr(opened[0], "input", "options")), 3)
+	testing.expect(t, strings.has_prefix(jstr(opened[0], "input", "text"), "Select model"))
+	testing.expect_value(t, jstr(jarr(opened[0], "input", "options")[2]), "Haiku")
+	testing.expect_value(t, hub().state, "awaiting_input")
+	// Answered by number, as a person would pick it.
+	bad, _ := parse_json(fmt.tprintf(`{{"id":"%s","option":9}}`, jstr(opened[0], "id")))
+	_, berr := rpc_dialog_respond(bad)
+	testing.expect(t, berr != "")
+	pick, _ := parse_json(fmt.tprintf(`{{"id":"%s","option":3}}`, jstr(opened[0], "id")))
+	res, err := rpc_dialog_respond(pick)
+	testing.expect_value(t, err, "")
+	testing.expect(t, strings.contains(res, `"answered"`))
+	testing.expect_value(t, len(hub().dialogs), 0)
+	testing.expect(t, settling())
+	// The card leaving the screen ends the wait.
+	screen_feed(app.screen, transmute([]u8)string("\x1b[2J\x1b[22;1H\u276f \x1b[24;1H  ? for shortcuts"))
+	hub().screen_dirty = true
+	hub().screen_checked_at = 0
+	hub_after_tick()
+	testing.expect(t, !settling())
+}
+
+@(test)
+shutdown_ends_the_turn_then_types_exit_then_hangs_up :: proc(t: ^testing.T) {
+	reset_app()
+	app.child_pid = 999_999_999 // no such process: signals go nowhere
+	hook_event(`{"hook_event_name":"SessionStart"}`)
+	hook_event(`{"hook_event_name":"UserPromptSubmit"}`)
+	testing.expect_value(t, begin_shutdown(), "graceful")
+	testing.expect(t, app.shutdown.esc_at != 0)
+	testing.expect_value(t, app.shutdown.exits, 0)
+	app.shutdown.esc_at -= 1000
+	hook_event(`{"hook_event_name":"Stop"}`)
+	shutdown_step()
+	testing.expect_value(t, app.shutdown.exits, 1)
+	// Prompts are refused rather than typed into a closing session.
+	_, err := hub_send_prompt("late", "inproc")
+	testing.expect(t, strings.contains(err, "shutting down"))
+	testing.expect_value(t, begin_shutdown(), "hangup")
+	testing.expect_value(t, begin_shutdown(), "kill")
+	hub_on_child_exit(137, 9)
+	testing.expect_value(t, begin_shutdown(), "exited")
 }
 
 @(test)

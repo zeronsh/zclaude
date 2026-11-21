@@ -4,13 +4,17 @@ package zclaude
 // hub keeps only what it needs to act correctly (open dialogs, prompts in flight,
 // streams still receiving tokens), and forwards everything else as it happens.
 
+import "core:c"
 import "core:encoding/base64"
 import "core:encoding/json"
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:sys/posix"
 
 KEY_DELAY_MS :: 120
+// The screen is read for the permission mode and plan choices at most this often.
+SCREEN_CHECK_MS :: 250
 ENTER_RETRY_MS :: 1000
 ENTER_RETRIES :: 3
 
@@ -32,6 +36,21 @@ Dialog :: struct {
 	hook_client: int,    // the held hook connection; 0 once it has gone
 	hook_req:    string,
 	touched:     bool,
+	// Plan dialogs: the approve modes the terminal offers, in its order, read from
+	// the screen once the card is drawn. Empty until then.
+	modes:       [dynamic]string,
+}
+
+// After a consumer answers a dialog, Claude Code still has to take the card off the
+// screen. Keys typed before that would land in the card, so typing waits until the
+// tool reports back, the turn ends, or SETTLE_MS passes.
+SETTLE_MS :: 3000
+
+Settle :: struct {
+	id:    string, // tool_use_id, perm-N or elicitation id
+	tool:  string,
+	kind:  string,
+	until: i64,
 }
 
 Pending_Tool :: struct {
@@ -65,6 +84,9 @@ Live_Stream :: struct {
 
 Tail :: struct {
 	path:        string,
+	// Kept open between polls, so a poll with nothing new is one fstat.
+	fd:          c.int,
+	has_fd:      bool,
 	offset:      i64,
 	partial:     [dynamic]u8,
 	// Lines before this offset predate this process (a resume): forwarded, but
@@ -77,6 +99,7 @@ Mode_Task :: struct {
 	req_id:    string,
 	target:    string,
 	attempts:  int,
+	waits:     int, // steps spent waiting for a card to go
 	seen:      [dynamic]string,
 }
 
@@ -124,6 +147,10 @@ Hub :: struct {
 	screen_dirty:       bool,
 	screen_checked_at:  i64,
 	exited_code:        int,
+	state_before_dialog: string,
+	settle:             Maybe(Settle),
+	// When a card with no dialog behind it was first seen, 0 if none is up.
+	card_since:         i64,
 }
 
 hub :: proc() -> ^Hub {
@@ -142,6 +169,8 @@ set_state :: proc(state: string) {
 	h := hub()
 	if h.state == state do return
 	previous := h.state
+	// Where to return once the dialogs are answered: a card can come up while idle.
+	if state == "awaiting_input" do h.state_before_dialog = previous
 	h.state = state
 	ev := event("state")
 	jw_str(&ev.w, "state", state)
@@ -206,6 +235,14 @@ write_dialog :: proc(w: ^Jw, d: ^Dialog) {
 	jw_int(w, "created_at", d.created_at)
 	jw_bool(w, "held", d.hook_client != 0)
 	jw_bool(w, "touched", d.touched)
+	if d.kind == "plan" do write_modes(w, d)
+}
+
+@(private = "file")
+write_modes :: proc(w: ^Jw, d: ^Dialog) {
+	jw_arr_key(w, "modes")
+	for m in d.modes do jw_str_item(w, m)
+	jw_end_arr(w)
 }
 
 write_prompt :: proc(w: ^Jw, p: ^Prompt) {
@@ -289,6 +326,8 @@ hook_common :: proc(params: Value) {
 	h := hub()
 	if jhas(params, "agent_id") do return
 	if path := jstr(params, "transcript_path"); path != "" && path != h.tail.path {
+		if h.tail.has_fd do c_close(h.tail.fd)
+		h.tail.has_fd = false
 		delete(h.tail.path)
 		clear(&h.tail.partial)
 		h.tail.path = strings.clone(path)
@@ -401,6 +440,7 @@ update_dialogs :: proc(name, tool: string, params: Value) {
 				break
 			}
 		}
+		if st, ok := h.settle.?; ok && (st.id == id || (strings.has_prefix(st.id, "perm-") && st.tool == tool)) do settle_end()
 		status := name == "PermissionDenied" ? "denied" : tool == "AskUserQuestion" ? "answered" : "allowed"
 		answers := ""
 		if name == "PostToolUse" && tool == "AskUserQuestion" {
@@ -417,6 +457,7 @@ update_dialogs :: proc(name, tool: string, params: Value) {
 			}
 		}
 	case "ElicitationResult":
+		if st, ok := h.settle.?; ok && st.kind == "elicitation" do settle_end()
 		elicitation := jstr(params, "elicitation_id")
 		for d in h.dialogs {
 			if d.kind == "elicitation" && (elicitation == "" || d.id == elicitation) {
@@ -428,9 +469,45 @@ update_dialogs :: proc(name, tool: string, params: Value) {
 	// A turn or session that has ended can't still be showing a dialog.
 	case "Stop", "StopFailure", "SessionStart", "SessionEnd":
 		cancel_open_dialogs()
+		settle_end()
 		for t in h.pending_tools do pending_tool_free(t)
 		clear(&h.pending_tools)
 	}
+}
+
+// Holds typing until Claude Code has taken an answered card off the screen.
+settle_begin :: proc(d: ^Dialog) {
+	h := hub()
+	settle_end()
+	h.settle = Settle {
+		id    = strings.clone(d.id),
+		tool  = strings.clone(d.tool),
+		kind  = strings.clone(d.kind),
+		until = now_ms() + SETTLE_MS,
+	}
+	// Wakes the loop when the wait runs out, even if nothing else happens.
+	timer_add(SETTLE_MS, .Settle)
+}
+
+settle_end :: proc() {
+	h := hub()
+	st, ok := h.settle.?
+	if !ok do return
+	delete(st.id)
+	delete(st.tool)
+	delete(st.kind)
+	h.settle = nil
+}
+
+settling :: proc() -> bool {
+	h := hub()
+	st, ok := h.settle.?
+	if !ok do return false
+	if now_ms() >= st.until {
+		settle_end()
+		return false
+	}
+	return true
 }
 
 pending_tool_free :: proc(t: Pending_Tool) {
@@ -501,7 +578,6 @@ hub_on_elicitation :: proc(cl: ^Client, req_id: string, params: Value) {
 	open_dialog(cl, req_id, id, "elicitation", "", strings.to_string(b), "")
 }
 
-@(private = "file")
 open_dialog :: proc(cl: ^Client, req_id, id, kind, tool, input, suggestions: string) {
 	h := hub()
 	d := new(Dialog)
@@ -511,13 +587,15 @@ open_dialog :: proc(cl: ^Client, req_id, id, kind, tool, input, suggestions: str
 	d.input = strings.clone(input)
 	d.suggestions = strings.clone(suggestions)
 	d.created_at = wall_ms()
-	d.hook_client = cl.id
+	d.hook_client = cl != nil ? cl.id : 0
 	d.hook_req = strings.clone(req_id)
 	append(&h.dialogs, d)
 	ev := event("dialog.open")
 	write_dialog(&ev.w, d)
 	event_send(ev)
 	set_state("awaiting_input")
+	// The card may be fully drawn before its hook arrives, with no output after.
+	h.screen_dirty = true
 }
 
 // Releases the held hook. An empty output leaves the decision to the terminal.
@@ -536,6 +614,8 @@ release_hook :: proc(d: ^Dialog, output: string) {
 
 close_dialog :: proc(d: ^Dialog, status, resolved_by: string, answers: string, output := "") {
 	h := hub()
+	// Only a released hook leaves a card that Claude Code still has to take down.
+	if resolved_by == "rpc" && d.hook_client != 0 && output != "" do settle_begin(d)
 	release_hook(d, output)
 	ev := event("dialog.update")
 	jw_str(&ev.w, "id", d.id)
@@ -555,15 +635,23 @@ close_dialog :: proc(d: ^Dialog, status, resolved_by: string, answers: string, o
 	delete(d.input)
 	delete(d.suggestions)
 	delete(d.hook_req)
+	for m in d.modes do delete(m)
+	delete(d.modes)
 	free(d)
-	if len(h.dialogs) == 0 && h.state == "awaiting_input" do set_state("busy")
+	if len(h.dialogs) == 0 && h.state == "awaiting_input" do set_state(h.state_before_dialog == "idle" ? "idle" : "busy")
 }
 
 cancel_open_dialogs :: proc() {
 	h := hub()
 	for len(h.dialogs) > 0 {
 		d := h.dialogs[0]
-		close_dialog(d, d.kind == "question" || d.kind == "elicitation" ? "cancelled" : "denied", "", "")
+		status := "denied"
+		switch d.kind {
+		case "question", "elicitation": status = "cancelled"
+		case "plan": status = "rejected"
+		case "terminal": status = "closed"
+		}
+		close_dialog(d, status, "", "")
 	}
 }
 
@@ -651,33 +739,50 @@ on_escape :: proc() {
 
 hub_poll_transcript :: proc() {
 	h := hub()
-	if h.tail.path == "" do return
-	fd := c_open(strings.clone_to_cstring(h.tail.path, context.temp_allocator), 0)
-	if fd < 0 do return // Claude Code creates it with the first message.
-	defer c_close(fd)
-	chunk := make([dynamic]u8, context.temp_allocator)
-	buf: [65536]u8
-	if c_lseek(fd, h.tail.offset, 0) < 0 do return
-	for {
-		n := c_read(fd, &buf[0], len(buf))
-		if n <= 0 do break
-		append(&chunk, ..buf[:n])
+	t := &h.tail
+	if t.path == "" do return
+	if !t.has_fd {
+		fd := c_open(strings.clone_to_cstring(t.path, context.temp_allocator), O_RDONLY | O_CLOEXEC)
+		if fd < 0 do return // Claude Code creates it with the first message.
+		t.fd, t.has_fd = fd, true
 	}
-	if len(chunk) == 0 do return
-	line_offset := h.tail.offset - i64(len(h.tail.partial))
-	h.tail.offset += i64(len(chunk))
-	data := make([dynamic]u8, context.temp_allocator)
-	append(&data, ..h.tail.partial[:])
-	append(&data, ..chunk[:])
-	clear(&h.tail.partial)
+	st: posix.stat_t
+	if posix.fstat(posix.FD(t.fd), &st) != .OK do return
+	size := i64(st.st_size)
+	if size <= t.offset do return
+	chunk := make([]u8, size - t.offset, context.temp_allocator)
+	got := 0
+	for got < len(chunk) {
+		n := c_pread(t.fd, raw_data(chunk[got:]), c.size_t(len(chunk)) - c.size_t(got), t.offset + i64(got))
+		if n < 0 && errno() == EINTR do continue
+		if n <= 0 do break
+		got += int(n)
+	}
+	if got == 0 do return
+	line_offset := t.offset - i64(len(t.partial))
+	t.offset += i64(got)
+	data := make([dynamic]u8, 0, len(t.partial) + got, context.temp_allocator)
+	append(&data, ..t.partial[:])
+	append(&data, ..chunk[:got])
+	clear(&t.partial)
 	start := 0
 	for i in 0 ..< len(data) {
 		if data[i] != '\n' do continue
-		historic := line_offset + i64(i) < h.tail.catchup_end
+		historic := line_offset + i64(i) < t.catchup_end
 		handle_transcript_line(string(data[start:i]), historic)
 		start = i + 1
 	}
-	append(&h.tail.partial, ..data[start:])
+	append(&t.partial, ..data[start:])
+}
+
+// How often the transcript is read when no hook says something happened: often
+// while a turn runs or a prompt is on its way, rarely otherwise. Every hook reads it
+// at once anyway.
+transcript_interval :: proc() -> i64 {
+	h := hub()
+	if h.tail.path == "" do return 1000
+	if h.state == "busy" || h.state == "awaiting_input" || len(h.in_flight) > 0 || len(h.streams) > 0 do return 100
+	return 1000
 }
 
 @(private = "file")
@@ -884,6 +989,7 @@ Send_Error :: enum {
 hub_send_prompt :: proc(text, transport: string, command := false) -> (^Prompt, string) {
 	h := hub()
 	if strings.trim_space(text) == "" do return nil, "prompt is empty"
+	if app.shutdown.stage != .None || app.child_exited do return nil, "the session is shutting down"
 	clean: string
 	switch transport {
 	case "hook":
@@ -922,7 +1028,7 @@ hub_send_prompt :: proc(text, transport: string, command := false) -> (^Prompt, 
 
 can_type_prompt :: proc() -> bool {
 	h := hub()
-	return h.session_started && len(h.dialogs) == 0 && h.state != "awaiting_input" && h.mode_task == nil && !app.child_exited
+	return h.session_started && len(h.dialogs) == 0 && h.state != "awaiting_input" && h.mode_task == nil && !app.child_exited && app.shutdown.stage == .None && !settling() && !card_on_screen(app.screen)
 }
 
 flush_inproc_queue :: proc() {
@@ -967,9 +1073,13 @@ feed_prompt :: proc(text: string) {
 	route := input_route()
 	send_input(route, transmute([]u8)paste)
 	// Enter must arrive separately, or the TUI treats it as part of the paste.
-	timer_add(KEY_DELAY_MS, .Input, "\r", route)
+	timer_add(KEY_DELAY_MS, .Enter, "", route, 0, h.feed_gen)
 	if retry do timer_add(KEY_DELAY_MS + ENTER_RETRY_MS, .Enter_Retry, "", route, 1, h.feed_gen)
 }
+
+// How long a prompt's Enter waits for a card that opened under it.
+ENTER_HOLD_MS :: 60_000
+ENTER_HOLD_STEP_MS :: 100
 
 // The rewake waiter: a hook process that blocks until a prompt arrives.
 hub_on_hook_wait :: proc(cl: ^Client, req_id: string) {
@@ -1216,14 +1326,27 @@ hub_on_timer :: proc(t: Timer) {
 	switch t.kind {
 	case .Input:
 		send_input(t.route, transmute([]u8)t.data)
+	case .Enter:
+		// A card that opened between the paste and its Enter would take the Enter as
+		// "Yes". It waits until the card has gone, and the draft is sent then.
+		if t.gen != h.feed_gen do return
+		if len(h.dialogs) > 0 || settling() || card_on_screen(app.screen) {
+			if t.n * ENTER_HOLD_STEP_MS < ENTER_HOLD_MS do timer_add(ENTER_HOLD_STEP_MS, .Enter, "", t.route, t.n + 1, t.gen)
+			return
+		}
+		send_input(t.route, transmute([]u8)string("\r"))
 	case .Enter_Retry:
 		// UserPromptSubmit comes before anything that could open a dialog, so once it
 		// is seen no further Enter is sent that could answer one.
-		if h.prompt_submitted || t.gen != h.feed_gen || len(h.dialogs) > 0 do return
+		if h.prompt_submitted || t.gen != h.feed_gen || len(h.dialogs) > 0 || card_on_screen(app.screen) do return
 		send_input(t.route, transmute([]u8)string("\r"))
 		if t.n < ENTER_RETRIES do timer_add(ENTER_RETRY_MS, .Enter_Retry, "", t.route, t.n + 1, t.gen)
 	case .Mode_Step:
 		mode_step()
+	case .Settle:
+		// Nothing to do: the loop woke, and the next tick types what was held.
+	case .Shutdown:
+		shutdown_step()
 	case .Memory_Timeout:
 		if req, has := h.memory_requests[t.n]; has {
 			delete_key(&h.memory_requests, t.n)
@@ -1240,24 +1363,371 @@ hub_on_screen_change :: proc() {
 hub_after_tick :: proc() {
 	h := hub()
 	flush_inproc_queue()
-	if h.screen_dirty && now_ms() - h.screen_checked_at >= 250 {
+	if h.screen_dirty && now_ms() - h.screen_checked_at >= SCREEN_CHECK_MS {
 		h.screen_dirty = false
 		h.screen_checked_at = now_ms()
 		if mode, ok := detect_mode(app.screen); ok && len(h.dialogs) == 0 {
 			set_meta("permission_mode", &h.permission_mode, mode)
 		}
+		for d in h.dialogs {
+			if d.kind != "plan" || len(d.modes) > 0 do continue
+			learn_plan_modes(d)
+			// Still being drawn: look again. A card that offers no approve choice
+			// (an empty plan) never gets any, so this stops after a while.
+			if len(d.modes) == 0 && wall_ms() - d.created_at < PLAN_MODES_WAIT_MS do h.screen_dirty = true
+		}
+		sync_terminal_card()
 	}
+}
+
+// A card has to stay up this long before it is reported without a hook behind it,
+// so the hook that usually comes with a card wins the race to describe it.
+CARD_GRACE_MS :: 600
+PLAN_MODES_WAIT_MS :: 5000
+
+// Reports selection cards that no hook told zclaude about (a model picker, a card
+// whose hook timed out, anything new) as `terminal` dialogs, so a consumer always
+// sees what the terminal is waiting for and can answer it by choice number.
+@(private = "file")
+sync_terminal_card :: proc() {
+	h := hub()
+	term: ^Dialog
+	hooked := false
+	for d in h.dialogs {
+		if d.kind == "terminal" do term = d
+		else do hooked = true
+	}
+	menu := screen_menu(app.screen)
+	up := card_in(menu, app.screen)
+	if !up {
+		h.card_since = 0
+		if st, ok := h.settle.?; ok && st.kind == "terminal" do settle_end()
+		if term != nil do close_dialog(term, "closed", "terminal", "")
+		return
+	}
+	if hooked || settling() {
+		h.card_since = 0
+		if term != nil do close_dialog(term, "closed", "", "")
+		return
+	}
+	if term != nil {
+		// Another card replaced this one. Moving the highlight changes nothing.
+		if !same_options(term, menu) do close_dialog(term, "closed", "terminal", "")
+		else do return
+	}
+	text := card_text(app.screen)
+	now := now_ms()
+	if h.card_since == 0 do h.card_since = now
+	if now - h.card_since < CARD_GRACE_MS {
+		h.screen_dirty = true // look again on the next check
+		return
+	}
+	h.next_dialog += 1
+	open_dialog(nil, "", fmt.tprintf("term-%d", h.next_dialog), "terminal", "", card_input(menu, text), "")
+}
+
+@(private = "file")
+same_options :: proc(d: ^Dialog, menu: Menu) -> bool {
+	v, _ := parse_json(d.input)
+	shown := jarr(v, "options")
+	if len(shown) != len(menu.labels) do return false
+	for o, i in shown do if jstr(o) != menu.labels[i] do return false
+	return true
+}
+
+@(private = "file")
+card_input :: proc(menu: Menu, text: string) -> string {
+	b := strings.builder_make(context.temp_allocator)
+	w := jw_make(&b)
+	jw_obj(&w)
+	jw_str(&w, "text", text)
+	jw_arr_key(&w, "options")
+	for l in menu.labels do jw_str_item(&w, l)
+	jw_end_arr(&w)
+	jw_end_obj(&w)
+	return strings.to_string(b)
+}
+
+// The card's lines: from the rule drawn above it to the bottom of the screen.
+@(private = "file")
+card_text :: proc(s: ^Screen) -> string {
+	lines := screen_lines(s)
+	end := len(lines)
+	for end > 0 && strings.trim_space(lines[end - 1]) == "" do end -= 1
+	start := 0
+	for i := end - 1; i >= 0; i -= 1 {
+		if is_rule(lines[i]) {
+			start = i + 1
+			break
+		}
+	}
+	kept := make([dynamic]string, context.temp_allocator)
+	for l in lines[start:end] do append(&kept, strings.trim_right_space(l))
+	return strings.trim_space(strings.join(kept[:], "\n", context.temp_allocator))
+}
+
+// A line drawn across the screen, as Claude Code separates its cards: box-drawing
+// or block characters (─ ━ ╌ ▔ ▁ …) and nothing else.
+@(private = "file")
+is_rule :: proc(line: string) -> bool {
+	n := 0
+	for r in strings.trim_space(line) {
+		if r < 0x2500 || r > 0x259F do return false
+		n += 1
+	}
+	return n >= 10
+}
+
+// Answers whatever card is on screen by its choice number, the way a person
+// would: arrows to the choice, any text into its field, then Enter. `0` is Esc.
+answer_card :: proc(option: int, text: string) -> string {
+	menu := screen_menu(app.screen)
+	if !card_in(menu, app.screen) do return "no card is on the terminal screen"
+	if option < 0 || option > len(menu.labels) do return fmt.tprintf("option must be 1 to %d, or 0 for Esc", len(menu.labels))
+	steps := make([dynamic]string, context.temp_allocator)
+	if option == 0 {
+		append(&steps, "\x1b")
+	} else {
+		delta := (option - 1) - max(menu.cursor, 0)
+		key, _ := key_bytes(delta < 0 ? "up" : "down")
+		for _ in 0 ..< abs(delta) do append(&steps, key)
+		if text != "" do append(&steps, fmt.tprintf("\x1b[200~%s\x1b[201~", text))
+		append(&steps, "\r")
+	}
+	for step, i in steps {
+		if i == 0 do pty_write(transmute([]u8)step)
+		else do timer_add(i64(i) * 60, .Input, step, .Pty)
+	}
+	return ""
+}
+
+// Reads the approve choices off the plan card once it is drawn. Claude Code builds
+// them from what this session allows (auto mode, bypass), so they differ between
+// sessions and versions.
+@(private = "file")
+learn_plan_modes :: proc(d: ^Dialog) {
+	modes := plan_modes_on_screen(app.screen)
+	if len(modes) == 0 do return
+	for m in modes do append(&d.modes, strings.clone(m))
+	ev := event("dialog.update")
+	jw_str(&ev.w, "id", d.id)
+	jw_str(&ev.w, "status", "open")
+	write_modes(&ev.w, d)
+	event_send(ev)
+}
+
+// A selection card as Claude Code draws it, e.g. "❯ 1. Yes" over "  2. No".
+Menu :: struct {
+	labels: []string,
+	cursor: int, // the highlighted choice, -1 if none
+}
+
+// The numbered choices on the screen. Lines between numbers (descriptions, wrapped
+// labels) are skipped. The last list that counts up from 1 wins, so numbered lines
+// in a plan above the card don't.
+screen_menu :: proc(s: ^Screen) -> Menu {
+	labels := make([dynamic]string, context.temp_allocator)
+	cursor := -1
+	for raw in screen_lines(s) {
+		line := strings.trim_space(raw)
+		marked := strings.has_prefix(line, "❯")
+		line = strings.trim_left_space(strings.trim_prefix(line, "❯"))
+		dot := strings.index_byte(line, '.')
+		if dot <= 0 || dot > 2 || dot + 1 >= len(line) || line[dot + 1] != ' ' do continue
+		n := 0
+		digits := true
+		for c in transmute([]u8)line[:dot] {
+			if c < '0' || c > '9' do digits = false
+			else do n = n * 10 + int(c - '0')
+		}
+		if !digits do continue
+		label := strings.trim_space(line[dot + 1:])
+		// A second column (a model's description, say) starts after a run of spaces.
+		if gap := strings.index(label, "   "); gap > 0 do label = label[:gap]
+		if n == 1 {
+			clear(&labels)
+			cursor = -1
+			append(&labels, label)
+		} else if n == len(labels) + 1 {
+			append(&labels, label)
+		} else {
+			continue
+		}
+		if marked do cursor = n - 1
+	}
+	return Menu{labels = labels[:], cursor = cursor}
+}
+
+// Whether a selection card is up in the terminal, whether or not a hook told
+// zclaude about it. Enter there picks the highlighted choice, so nothing is typed
+// while one is up. A card replaces the prompt box and its mode footer; a draft in
+// the prompt box that happens to look like a list keeps the footer.
+card_on_screen :: proc(s: ^Screen) -> bool {
+	return card_in(screen_menu(s), s)
+}
+
+card_in :: proc(menu: Menu, s: ^Screen) -> bool {
+	if len(menu.labels) < 2 || menu.cursor < 0 do return false
+	_, footer := detect_mode(s)
+	return !footer
+}
+
+plan_modes_on_screen :: proc(s: ^Screen) -> []string {
+	modes := make([dynamic]string, context.temp_allocator)
+	for label in screen_menu(s).labels {
+		l := strings.to_lower(label, context.temp_allocator)
+		mode := ""
+		switch {
+		// Clearing the context starts a new conversation, which a hook can't ask for.
+		case strings.contains(l, "clear context"):
+		case strings.contains(l, "bypass permissions"): mode = "bypassPermissions"
+		case strings.contains(l, "auto mode"): mode = "auto"
+		case strings.contains(l, "accept edits") || strings.contains(l, "auto-accept"): mode = "acceptEdits"
+		case strings.contains(l, "manually approve"): mode = "default"
+		}
+		if mode == "" do continue
+		seen := false
+		for m in modes do if m == mode do seen = true
+		if !seen do append(&modes, mode)
+	}
+	return modes[:]
 }
 
 hub_stdio_closed :: proc() {
 	// The consumer that owns a headless session has gone, so end it.
-	if app.child_pid > 0 && !app.child_exited do c_kill(app.child_pid, SIGHUP)
+	begin_shutdown()
 }
 
-hub_on_child_exit :: proc(code: int) {
+// ---------- Shutdown ----------
+
+// Ending a session the way a person would: the turn is stopped, cards are refused,
+// and /exit is typed, so Claude Code runs its SessionEnd hooks, saves its state and
+// exits 0. SIGHUP follows if that hasn't worked in SHUTDOWN_GRACE_MS, and SIGKILL
+// SHUTDOWN_KILL_MS later. Asking again skips ahead one stage.
+SHUTDOWN_GRACE_MS :: 6000
+SHUTDOWN_KILL_MS :: 4000
+SHUTDOWN_STEP_MS :: 100
+
+begin_shutdown :: proc(force := false) -> string {
+	h := hub()
+	if app.child_exited || app.child_pid <= 0 do return "exited"
+	sd := &app.shutdown
+	switch sd.stage {
+	case .None:
+		// Prompts nobody has typed yet will never be.
+		for list in ([]^[dynamic]^Prompt{&h.inproc_queue, &h.hook_queue}) {
+			for p in list^ {
+				prompt_status(p, "failed", "the session is shutting down")
+				prompt_free(p)
+			}
+			clear(list)
+		}
+		if force {
+			shutdown_hangup()
+		} else {
+			sd.stage = .Graceful
+			sd.hup_at = now_ms() + SHUTDOWN_GRACE_MS
+			shutdown_step()
+		}
+	case .Graceful:
+		shutdown_hangup()
+	case .Hangup, .Killed:
+		shutdown_kill()
+	}
+	#partial switch sd.stage {
+	case .Graceful: return "graceful"
+	case .Hangup: return "hangup"
+	}
+	return "kill"
+}
+
+@(private = "file")
+shutdown_hangup :: proc() {
+	sd := &app.shutdown
+	sd.stage = .Hangup
+	sd.kill_at = now_ms() + SHUTDOWN_KILL_MS
+	if !app.child_exited do c_kill(app.child_pid, SIGHUP)
+	timer_add(SHUTDOWN_KILL_MS, .Shutdown)
+}
+
+@(private = "file")
+shutdown_kill :: proc() {
+	app.shutdown.stage = .Killed
+	if app.child_exited do return
+	// Claude's process group is the terminal's foreground job: Claude itself, under
+	// the `__session` job-control process in interactive mode, and anything it
+	// started there that never left the group.
+	if app.pty_fd >= 0 {
+		if pg := c_tcgetpgrp(app.pty_fd); pg > 1 do c_kill(-pg, SIGKILL)
+	}
+	c_kill(app.child_pid, SIGKILL)
+}
+
+shutdown_step :: proc() {
+	h := hub()
+	sd := &app.shutdown
+	if app.child_exited do return
+	now := now_ms()
+	switch sd.stage {
+	case .None, .Killed:
+		return
+	case .Hangup:
+		if now >= sd.kill_at do shutdown_kill()
+		return
+	case .Graceful:
+	}
+	if now >= sd.hup_at {
+		shutdown_hangup()
+		return
+	}
+	defer timer_add(SHUTDOWN_STEP_MS, .Shutdown)
+	if !h.session_started do return
+	if len(h.dialogs) > 0 {
+		held := false
+		for d in h.dialogs do if d.hook_client != 0 do held = true
+		if held {
+			rpc_interrupt()
+		} else if now - sd.esc_at > 500 {
+			// A card only the terminal can answer: Esc refuses it.
+			send_input(input_route(), transmute([]u8)string("\x1b"))
+			sd.esc_at = now
+		}
+		return
+	}
+	if settling() do return
+	// A card zclaude has no hook for (or whose hook has gone): Enter would answer it,
+	// so it is refused with Esc first.
+	if card_on_screen(app.screen) || h.state == "awaiting_input" {
+		if now - sd.esc_at > 500 {
+			send_input(input_route(), transmute([]u8)string("\x1b"))
+			sd.esc_at = now
+		}
+		return
+	}
+	if h.state == "busy" {
+		if sd.esc_at == 0 {
+			send_input(input_route(), transmute([]u8)string("\x1b"))
+			sd.esc_at = now
+		}
+		// Claude Code takes a moment to wind a turn down after Esc.
+		if now - sd.esc_at < 400 do return
+	}
+	// Typed once, and again if the first was swallowed (by a menu, say).
+	if sd.exits == 0 || (sd.exits == 1 && now - sd.exit_at > 2500) {
+		route := input_route()
+		// Ctrl+U clears a draft, which would otherwise be sent ahead of /exit.
+		send_input(route, transmute([]u8)string("\x15\x1b[200~/exit\x1b[201~"))
+		timer_add(KEY_DELAY_MS, .Input, "\r", route)
+		sd.exits += 1
+		sd.exit_at = now
+	}
+}
+
+hub_on_child_exit :: proc(code: int, signal := 0) {
 	h := hub()
 	app.child_exited = true
 	app.exit_code = code
+	app.exit_signal = signal
 	h.exited_code = code
 	hub_poll_transcript()
 	cancel_open_dialogs()
@@ -1265,9 +1735,23 @@ hub_on_child_exit :: proc(code: int) {
 }
 
 hub_on_exit :: proc() {
+	// Everyone who asked the session for anything hears how it ended, subscribed or not.
+	for cl in app.clients do if cl.kind == .Control do cl.subscribed = true
 	ev := event("exit")
 	jw_int(&ev.w, "code", i64(app.exit_code))
+	if app.exit_signal != 0 do jw_str(&ev.w, "signal", signal_name(app.exit_signal))
 	event_send(ev)
+}
+
+signal_name :: proc(sig: int) -> string {
+	switch c.int(sig) {
+	case SIGHUP: return "SIGHUP"
+	case SIGINT: return "SIGINT"
+	case SIGKILL: return "SIGKILL"
+	case SIGPIPE: return "SIGPIPE"
+	case SIGTERM: return "SIGTERM"
+	}
+	return fmt.tprintf("signal %d", sig)
 }
 
 // The permission mode as the footer shows it, e.g. "⏵⏵ accept edits on (shift+tab to
@@ -1320,6 +1804,15 @@ mode_step :: proc() {
 	h := hub()
 	t := h.mode_task
 	if t == nil do return
+	// Shift+Tab on a card that is still closing would answer it (on a plan card it
+	// approves with feedback), so wait for it to go.
+	if settling() || card_on_screen(app.screen) {
+		if t.waits < 60 {
+			t.waits += 1
+			timer_add(100, .Mode_Step)
+			return
+		}
+	}
 	finish :: proc(t: ^Mode_Task, err: string, mode: string) {
 		h := hub()
 		if cl := client_by_id(t.client_id); cl != nil {
@@ -1349,6 +1842,10 @@ mode_step :: proc() {
 	}
 	if t.attempts >= 8 || len(h.dialogs) > 0 {
 		finish(t, fmt.tprintf("could not reach %s by cycling with Shift+Tab (saw: %s)", t.target, strings.join(t.seen[:], ", ", context.temp_allocator)), "")
+		return
+	}
+	if card_on_screen(app.screen) {
+		finish(t, "a dialog is on the terminal screen; answer it first", "")
 		return
 	}
 	t.attempts += 1

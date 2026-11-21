@@ -14,13 +14,15 @@ CTL_USAGE :: `usage: zclaude ctl [--socket PATH] <command>
   send [--hook] TEXT            send a prompt (in-process by default, or the rewake hook)
   command /NAME [ARGS]          run a slash command, e.g. /compact
   model [NAME]                  show or switch the model
-  mode NAME                     default | acceptEdits | plan | auto | bypassPermissions
-  interrupt                     cancel the current turn (or refuse the open dialog)
-  answer DIALOG_ID JSON         e.g. '{"answers":[{"selected":["Green"]}]}' or '{"decision":"allow"}'
+  mode NAME                     default | acceptEdits | plan | auto | dontAsk | bypassPermissions
+  interrupt                     end the turn, or refuse the open dialog
+  answer DIALOG_ID JSON         e.g. '{"answers":[{"selected":["Green"]}]}', '{"decision":"allow"}',
+                                '{"decision":"approve","mode":"acceptEdits"}' or '{"option":2}'
   keys KEY...                   enter, esc, shift+tab, up, ctrl+c, ... or text:WORDS
   screen                        the terminal screen as text
   subscribe [--term] [--history]  print events as JSON lines
   memory                        heap statistics, read inside Claude's process
+  shutdown [--force]            end the session (/exit, then SIGHUP, then SIGKILL)
   call METHOD [JSON]            any method
 
 Without --socket, the most recently started live session is used.`
@@ -197,6 +199,9 @@ run_ctl :: proc(args_in: []string) -> int {
 		return 0
 	case "memory":
 		method = "memory"
+	case "shutdown":
+		method = "shutdown"
+		params = fmt.tprintf("{{\"force\":%v}}", len(rest) > 0 && rest[0] == "--force")
 	case "call":
 		if len(rest) < 1 do return ctl_usage()
 		method = rest[0]

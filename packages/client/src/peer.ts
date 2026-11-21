@@ -14,25 +14,69 @@ export class RpcError extends Error {
 
 type Pending = { resolve: (value: any) => void; reject: (error: Error) => void };
 
+/** `connecting` until the transport can carry messages, `closed` once it can't. */
+export type PeerState = 'connecting' | 'open' | 'closed';
+
 export class Peer {
   #nextId = 0;
   #pending = new Map<number, Pending>();
   #listeners = new Map<string, Set<(params: any) => void>>();
   #any = new Set<(event: ZEvent) => void>();
+  #stateListeners = new Set<(state: PeerState) => void>();
   #buffer = '';
-  #closed = false;
+  #state: PeerState = 'connecting';
+  #closeReason = '';
+  #settleOpen!: { resolve: () => void; reject: (error: Error) => void };
 
-  constructor(private readonly writeLine: (line: string) => void) {}
+  /** Resolves once the transport is open; rejects if it closes first. */
+  readonly opened: Promise<void>;
+
+  constructor(private readonly writeLine: (line: string) => void) {
+    this.opened = new Promise<void>((resolve, reject) => (this.#settleOpen = { resolve, reject }));
+    // Nobody has to wait on `opened`, so a close before opening isn't unhandled.
+    this.opened.catch(() => {});
+  }
+
+  /** Called by the transport once messages can flow. */
+  markOpen(): void {
+    if (this.#state !== 'connecting') return;
+    this.#setState('open');
+    this.#settleOpen.resolve();
+  }
+
+  get state(): PeerState {
+    return this.#state;
+  }
+
+  /** Why the connection closed, once it has. */
+  get closeReason(): string {
+    return this.#closeReason;
+  }
+
+  /** Called with every change of `state`. */
+  onStateChange(listener: (state: PeerState) => void): () => void {
+    this.#stateListeners.add(listener);
+    return () => this.#stateListeners.delete(listener);
+  }
+
+  #setState(state: PeerState): void {
+    this.#state = state;
+    for (const listener of this.#stateListeners) listener(state);
+  }
 
   /** Feed raw text as it arrives; complete lines are dispatched. */
   feed(chunk: string): void {
+    // Only the new text is searched, so a long line arriving in pieces stays linear.
+    let from = this.#buffer.length;
     this.#buffer += chunk;
+    let start = 0;
     let end: number;
-    while ((end = this.#buffer.indexOf('\n')) >= 0) {
-      const line = this.#buffer.slice(0, end);
-      this.#buffer = this.#buffer.slice(end + 1);
+    while ((end = this.#buffer.indexOf('\n', from)) >= 0) {
+      const line = this.#buffer.slice(start, end);
+      start = from = end + 1;
       if (line.trim()) this.handleLine(line);
     }
+    if (start > 0) this.#buffer = this.#buffer.slice(start);
   }
 
   handleLine(line: string): void {
@@ -60,7 +104,7 @@ export class Peer {
   call<M extends Method>(method: M, ...args: Methods[M][0] extends undefined ? [params?: Methods[M][0]] : [params: Methods[M][0]]): Promise<Methods[M][1]>;
   call(method: string, params?: unknown): Promise<any>;
   call(method: string, params?: unknown): Promise<any> {
-    if (this.#closed) return Promise.reject(new Error('zclaude connection is closed'));
+    if (this.#state === 'closed') return Promise.reject(new Error(this.#closeReason || 'zclaude connection is closed'));
     const id = ++this.#nextId;
     return new Promise((resolve, reject) => {
       this.#pending.set(id, { resolve, reject });
@@ -83,27 +127,40 @@ export class Peer {
   /** Resolves with the first event of `type` that matches. */
   waitFor<E extends EventType>(type: E, predicate: (params: EventMap[E] & { seq: number }) => boolean = () => true, timeoutMs = 60_000): Promise<EventMap[E] & { seq: number }> {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      if (this.#state === 'closed') return reject(new Error(this.#closeReason));
+      const done = () => {
+        clearTimeout(timer);
         off();
+        offState();
+      };
+      const timer = setTimeout(() => {
+        done();
         reject(new Error(`timed out waiting for ${type}`));
       }, timeoutMs);
       const off = this.on(type, (params) => {
         if (!predicate(params)) return;
-        clearTimeout(timer);
-        off();
+        done();
         resolve(params);
+      });
+      const offState = this.onStateChange((state) => {
+        if (state !== 'closed') return;
+        done();
+        reject(new Error(this.#closeReason));
       });
     });
   }
 
+  /** Marks the connection closed: pending calls fail, and so do later ones. */
   close(reason = 'zclaude connection closed'): void {
-    if (this.#closed) return;
-    this.#closed = true;
+    if (this.#state === 'closed') return;
+    this.#closeReason = reason;
+    this.#setState('closed');
+    this.#settleOpen.reject(new Error(reason));
     for (const pending of this.#pending.values()) pending.reject(new Error(reason));
     this.#pending.clear();
   }
 
   get closed(): boolean {
-    return this.#closed;
+    return this.#state === 'closed';
   }
 }

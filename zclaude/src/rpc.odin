@@ -111,8 +111,8 @@ handle_message :: proc(cl: ^Client, line: string) {
 	case "memory":
 		if err := hub_memory(cl, id); err != "" do reply_error(cl, id, err)
 	case "shutdown":
-		if app.child_pid > 0 && !app.child_exited do c_kill(app.child_pid, SIGHUP)
-		reply_result(cl, id, "true")
+		how := begin_shutdown(force = jbool(params, "force"))
+		reply_result(cl, id, fmt.tprintf(`{{"stopping":"%s"}}`, how))
 	case:
 		if id != "" do reply_error(cl, id, fmt.tprintf("unknown method %q", method), -32601)
 	}
@@ -376,6 +376,20 @@ build_answers :: proc(input: Value, answers: Value) -> (Object, string) {
 	return out, ""
 }
 
+// Claude Code's own wording when a person refuses a call at the terminal, so a
+// refusal over RPC reads to Claude exactly like one typed there.
+REFUSED :: "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file)."
+REFUSED_STOP :: REFUSED + " STOP what you are doing and wait for the user to tell you how to proceed."
+REFUSED_SAID :: REFUSED + " To tell you how to proceed, the user said:\n"
+
+// What Claude reads for a refusal with feedback, as the terminal's "Tell Claude what
+// to do differently" puts it.
+@(private = "file")
+refusal :: proc(message: string, interrupt: bool) -> string {
+	if message != "" do return strings.concatenate({REFUSED_SAID, message}, context.temp_allocator)
+	return interrupt ? REFUSED_STOP : REFUSED
+}
+
 @(private = "file")
 decision_json :: proc(behavior: string, updated_input: Value, updated_permissions: string, message: string, interrupt: bool) -> string {
 	b := strings.builder_make(context.temp_allocator)
@@ -395,19 +409,45 @@ decision_json :: proc(behavior: string, updated_input: Value, updated_permission
 	return strings.to_string(b)
 }
 
+// Answers the card on screen by choice number: `terminal` dialogs, and dialogs whose
+// hook has gone. `{"option": N, "text"?: "..."}`, or `{"decision": "cancel"}` for Esc.
+@(private = "file")
+respond_on_screen :: proc(d: ^Dialog, params: Value) -> (string, string) {
+	option := 0
+	if n, ok := jint(params, "option"); ok {
+		option = int(n)
+		if option < 1 do return "", "option counts from 1"
+	} else if jstr(params, "decision") != "cancel" {
+		return "", "answer a card with {\"option\": N} (its choice number, optionally with \"text\" for a choice that takes text) or {\"decision\": \"cancel\"}"
+	}
+	if err := answer_card(option, clean_free_text(jstr(params, "text"))); err != "" do return "", err
+	status := option == 0 ? "cancelled" : "answered"
+	dialog_id := strings.clone(d.id, context.temp_allocator)
+	if d.kind != "terminal" {
+		// A hook dialog closes when Claude Code reports the tool's outcome.
+		return fmt.tprintf(`{{"dialog_id":"%s","status":"sent"}}`, dialog_id), ""
+	}
+	settle_begin(d)
+	close_dialog(d, status, "rpc", "")
+	return fmt.tprintf(`{{"dialog_id":"%s","status":"%s"}}`, dialog_id, status), ""
+}
+
 rpc_dialog_respond :: proc(params: Value) -> (string, string) {
 	id := jstr(params, "id")
 	if id == "" do id = jstr(params, "dialog_id")
 	d := find_dialog(id)
 	if d == nil do return "", fmt.tprintf("no open dialog %q", id)
+	if d.kind == "terminal" || (d.hook_client == 0 && jhas(params, "option")) {
+		return respond_on_screen(d, params)
+	}
 	if d.hook_client == 0 {
-		return "", "this dialog is no longer held by zclaude, so it can only be answered on the terminal screen: read it with `screen` and answer with `keys`"
+		return "", "this dialog is no longer held by zclaude, so only its card on the terminal can answer it: pick a choice with {\"option\": N} (see `screen`), or use `keys`"
 	}
 	input, _ := parse_json(d.input)
 	decision := jstr(params, "decision")
 	message := jstr(params, "message")
 	interrupt := jbool(params, "interrupt")
-	output, status, answers: string
+	output, status, answers, mode, feedback: string
 	switch d.kind {
 	case "question":
 		if decision == "cancel" || decision == "deny" || decision == "decline" {
@@ -434,13 +474,25 @@ rpc_dialog_respond :: proc(params: Value) -> (string, string) {
 			if p := jget(params, "updated_permissions"); p != nil {
 				perms = to_json(p, context.temp_allocator)
 			} else if decision == "allow_always" {
+				// The card's "Yes, and always allow ..." choice applies these.
 				if d.suggestions == "" || d.suggestions == "[]" do return "", "this dialog offers no rule to always allow; use \"allow\""
 				perms = d.suggestions
+			}
+			// "Yes, and switch to auto mode", or any other mode, with the allow.
+			if m := jstr(params, "mode"); m != "" {
+				switch m {
+				case "default", "acceptEdits", "auto", "dontAsk", "plan", "bypassPermissions":
+				case:
+					return "", fmt.tprintf("unknown mode %q", m)
+				}
+				set_mode := fmt.tprintf(`{{"type":"setMode","mode":"%s","destination":"session"}}`, m)
+				perms = perms == "" || perms == "[]" ? fmt.tprintf("[%s]", set_mode) : fmt.tprintf("%s,%s]", perms[:len(perms) - 1], set_mode)
+				mode = m
 			}
 			output = decision_json("allow", updated_input, perms, "", false)
 			status = "allowed"
 		case "deny":
-			output = decision_json("deny", nil, "", message, interrupt)
+			output = decision_json("deny", nil, "", refusal(message, interrupt), interrupt)
 			status = "denied"
 		case:
 			return "", "decision must be \"allow\", \"allow_always\" or \"deny\""
@@ -448,23 +500,44 @@ rpc_dialog_respond :: proc(params: Value) -> (string, string) {
 	case "plan":
 		switch decision {
 		case "approve", "allow":
+			// Without a mode, the first one the card offers, as Enter would pick. Before
+			// the card is drawn none is known, and Claude Code restores the mode the
+			// session had before plan mode.
+			mode = jstr(params, "mode")
+			if mode == "" && len(d.modes) > 0 do mode = d.modes[0]
 			perms := ""
-			if mode := jstr(params, "mode"); mode != "" {
+			if mode != "" {
 				switch mode {
-				case "default", "acceptEdits", "auto", "bypassPermissions", "dontAsk":
+				case "default", "acceptEdits", "auto", "dontAsk":
+				case "bypassPermissions":
+					offered := false
+					for m in d.modes do if m == mode do offered = true
+					if !offered do return "", "this session does not offer bypassPermissions (start claude with --allow-dangerously-skip-permissions)"
 				case:
-					return "", fmt.tprintf("unknown mode %q", mode)
+					return "", fmt.tprintf("unknown mode %q, expected one of the dialog's modes: default, acceptEdits, auto, dontAsk or bypassPermissions", mode)
 				}
 				perms = fmt.tprintf(`[{{"type":"setMode","mode":"%s","destination":"session"}}]`, mode)
 			}
-			output = decision_json("allow", nil, perms, "", false)
+			// Tools that need a person (ExitPlanMode, AskUserQuestion) only take a hook's
+			// allow when it carries the input, which is also how an edited plan goes back.
+			updated := make(Object, context.temp_allocator)
+			if obj, is_obj := input.(Object); is_obj do for k, v in obj do updated[k] = v
+			if edited, has := jget(params, "plan").(json.String); has {
+				if strings.trim_space(string(edited)) == "" do return "", "plan is empty"
+				updated["plan"] = edited
+			}
+			output = decision_json("allow", updated, perms, "", false)
 			status = "approved"
+			feedback = message
 		case "deny", "reject":
-			if message == "" do message = "The user rejected this plan. Keep planning and ask what to change."
-			output = decision_json("deny", nil, "", message, interrupt)
+			// The card's "Tell Claude what to change". Without feedback, Claude is told
+			// to keep planning, unless the turn is interrupted too (Esc on the card).
+			reason := refusal(message, interrupt)
+			if message == "" && !interrupt do reason = strings.concatenate({REFUSED, " Stay in plan mode: ask the user what to change in the plan, revise it, and present it again."}, context.temp_allocator)
+			output = decision_json("deny", nil, "", reason, interrupt)
 			status = "rejected"
 		case:
-			return "", "decision must be \"approve\" (optionally with a mode) or \"deny\" (optionally with a message)"
+			return "", "decision must be \"approve\" (with an optional mode, plan or message) or \"reject\" (with an optional message)"
 		}
 	case "elicitation":
 		action := jstr(params, "action")
@@ -488,5 +561,17 @@ rpc_dialog_respond :: proc(params: Value) -> (string, string) {
 	}
 	dialog_id := strings.clone(d.id, context.temp_allocator)
 	close_dialog(d, status, "rpc", answers, output)
-	return fmt.tprintf(`{{"dialog_id":"%s","status":"%s"}}`, dialog_id, status), ""
+	b := strings.builder_make(context.temp_allocator)
+	w := jw_make(&b)
+	jw_obj(&w)
+	jw_str(&w, "dialog_id", dialog_id)
+	jw_str(&w, "status", status)
+	if mode != "" do jw_str(&w, "mode", mode)
+	if feedback != "" {
+		// A hook can't attach feedback to an approval, so it follows as the next
+		// prompt, typed once the card has gone. Claude reads it before going on.
+		if p, err := hub_send_prompt(feedback, "inproc"); err == "" do jw_str(&w, "prompt_id", p.id)
+	}
+	jw_end_obj(&w)
+	return strings.to_string(b), ""
 }

@@ -24,14 +24,25 @@ export interface Meta {
   hook_waiter_armed: boolean;
 }
 
-export type DialogKind = 'question' | 'permission' | 'plan' | 'elicitation';
+/**
+ * `terminal` is a selection card on the terminal that no hook describes (a model
+ * picker, a card whose hook has gone, anything new): its `input` is
+ * `{ text, options }`, read off the screen, and it is answered by choice number.
+ */
+export type DialogKind = 'question' | 'permission' | 'plan' | 'elicitation' | 'terminal';
+
+/** Modes a plan can be approved into. */
+export type PlanMode = Exclude<PermissionMode, 'plan'>;
 
 export interface DialogInfo {
   id: string;
   kind: DialogKind;
-  /** The tool asking, e.g. Bash, AskUserQuestion, ExitPlanMode. Empty for elicitation. */
+  /** The tool asking, e.g. Bash, AskUserQuestion, ExitPlanMode. Empty for elicitation and terminal. */
   tool: string;
-  /** The tool input. For elicitation: { server, message, mode?, url?, requested_schema? }. */
+  /**
+   * The tool input. For elicitation: { server, message, mode?, url?, requested_schema? }.
+   * For terminal: { text: the card as shown, options: its choice labels }.
+   */
   input: any;
   /** Rules the terminal would offer to "always allow" (permission_suggestions). */
   suggestions: any[];
@@ -41,6 +52,33 @@ export interface DialogInfo {
   held: boolean;
   /** Someone pressed keys in the terminal while it was open. */
   touched: boolean;
+  /**
+   * Plan dialogs: the approve choices the terminal card offers, in its order, e.g.
+   * ['auto', 'default']. Empty until the card is drawn; a `dialog.update` fills it.
+   */
+  modes?: PlanMode[];
+}
+
+/** Statuses a dialog can end in. */
+export type DialogStatus =
+  | 'open'
+  | 'answered' | 'cancelled' // question
+  | 'allowed' | 'denied' // permission
+  | 'approved' | 'rejected' // plan
+  | 'accepted' | 'declined' // elicitation (also 'cancelled')
+  | 'closed'; // terminal: the card went away by itself (also 'answered', 'cancelled')
+
+/** Changes to an open dialog, or how it closed. Only the fields that changed are set. */
+export interface DialogUpdate {
+  id: string;
+  status: DialogStatus;
+  /** Who closed it. Absent when a turn or session ending closed it. */
+  resolved_by?: 'rpc' | 'terminal';
+  /** Questions: each question's text mapped to the answer Claude received. */
+  answers?: Record<string, string>;
+  held?: boolean;
+  touched?: boolean;
+  modes?: PlanMode[];
 }
 
 export interface PromptInfo {
@@ -116,10 +154,11 @@ export interface EventMap {
   'stream.end': { stream: number; status: 'done' | 'aborted'; ended_at: number };
   'stream.confirmed': { stream: number; message_id: string };
   'dialog.open': DialogInfo;
-  'dialog.update': { id: string; status: string; resolved_by?: 'rpc' | 'terminal'; answers?: Record<string, string>; held?: boolean; touched?: boolean };
+  'dialog.update': DialogUpdate;
   'term.output': { data: string; redraw?: boolean };
   'term.resize': { cols: number; rows: number };
-  exit: { code: number };
+  /** Claude's exit code; 128 + n when signal n ended it, which `signal` names. */
+  exit: { code: number; signal?: string };
 }
 
 export type EventType = keyof EventMap;
@@ -133,14 +172,71 @@ export interface QuestionAnswer {
   other?: string;
 }
 
-export type DialogResponse =
-  | { decision: 'allow' | 'allow_always'; updated_input?: Record<string, unknown>; updated_permissions?: unknown[] }
-  | { decision: 'deny'; message?: string; interrupt?: boolean }
+/** Answers or declines an AskUserQuestion dialog. */
+export type QuestionResponse =
   | { answers: QuestionAnswer[] | Record<string, string> }
-  | { decision: 'cancel'; message?: string }
-  | { decision: 'approve'; mode?: Exclude<PermissionMode, 'plan'> }
-  | { decision: 'reject'; message?: string }
-  | { action: 'accept' | 'decline' | 'cancel'; content?: Record<string, unknown> };
+  | { decision: 'cancel'; message?: string; interrupt?: boolean };
+
+/** Decides a tool permission dialog. */
+export type PermissionResponse =
+  | {
+      decision: 'allow' | 'allow_always';
+      /** Run the tool with this input instead. */
+      updated_input?: Record<string, unknown>;
+      /** Rules to add; `allow_always` without these uses the dialog's `suggestions`. */
+      updated_permissions?: unknown[];
+      /** Also switch the permission mode, like the card's "Yes, and switch to auto mode". */
+      mode?: PermissionMode;
+    }
+  /** `message` reaches Claude as the terminal's "tell Claude what to do differently". */
+  | { decision: 'deny'; message?: string; interrupt?: boolean };
+
+/** Decides an ExitPlanMode dialog, like the terminal card's choices. */
+export type PlanResponse =
+  | {
+      decision: 'approve';
+      /** Defaults to the card's first choice (`modes[0]`), as Enter would pick. */
+      mode?: PlanMode;
+      /** An edited plan, carried out instead of Claude's. */
+      plan?: string;
+      /** Feedback with the approval. Sent as the next prompt; its id is in the result. */
+      message?: string;
+    }
+  /** "Tell Claude what to change": Claude keeps planning. `interrupt` also ends the turn. */
+  | { decision: 'reject'; message?: string; interrupt?: boolean };
+
+/** Answers an MCP server's elicitation. */
+export type ElicitationResponse = { action: 'accept' | 'decline' | 'cancel'; content?: Record<string, unknown> };
+
+/**
+ * Picks a choice on the card on screen, the way a person would: arrows to it, `text`
+ * into its field if it has one, then Enter. Cancel is Esc. Works for `terminal`
+ * dialogs, and for any dialog that is no longer `held`.
+ */
+export type CardResponse = { option: number; text?: string } | { decision: 'cancel' };
+
+export interface DialogResponses {
+  question: QuestionResponse | CardResponse;
+  permission: PermissionResponse | CardResponse;
+  plan: PlanResponse | CardResponse;
+  elicitation: ElicitationResponse | CardResponse;
+  terminal: CardResponse;
+}
+
+/** The responses a dialog of kind `K` takes. */
+export type DialogResponseFor<K extends DialogKind> = DialogResponses[K];
+
+export type DialogResponse = DialogResponses[DialogKind];
+
+export interface DialogResult {
+  dialog_id: string;
+  /** How it closed; `sent` when a choice was picked on the card of a dialog no longer held. */
+  status: DialogStatus | 'sent';
+  /** The mode switched to (plans, or permissions allowed with `mode`). */
+  mode?: PermissionMode;
+  /** Plans approved with a message: the prompt that carries it. */
+  prompt_id?: string;
+}
 
 export type Key =
   | 'enter' | 'esc' | 'tab' | 'shift+tab' | 'up' | 'down' | 'left' | 'right' | 'home' | 'end'
@@ -166,7 +262,7 @@ export interface Methods {
   'prompt.send': [{ text: string; transport?: 'inproc' | 'hook' }, { prompt_id: string; status: string; transport: string }];
   command: [{ text: string }, { prompt_id: string; status: string }];
   interrupt: [undefined, { sent: boolean; via?: 'esc' | 'dialog'; state?: SessionState }];
-  'dialog.respond': [{ id: string } & DialogResponse, { dialog_id: string; status: string }];
+  'dialog.respond': [{ id: string } & DialogResponse, DialogResult];
   'model.set': [{ model: string }, { model: string; status: 'switching' }];
   'mode.set': [{ mode: PermissionMode }, { mode: PermissionMode }];
   keys: [{ keys?: Array<Key | { text: string } | { key: Key }>; text?: string; data?: string; delay_ms?: number }, true];
@@ -174,7 +270,12 @@ export interface Methods {
   'term.resize': [{ cols: number; rows: number }, true];
   screen: [{ ansi?: boolean } | undefined, ScreenInfo];
   memory: [undefined, any];
-  shutdown: [undefined, true];
+  /**
+   * Ends the session: stops the turn, refuses open dialogs and types /exit, then
+   * SIGHUP after 6 s and SIGKILL 4 s later. `force` (or calling again) skips ahead.
+   * Wait for the `exit` event.
+   */
+  shutdown: [{ force?: boolean } | undefined, { stopping: 'graceful' | 'hangup' | 'kill' | 'exited' }];
 }
 
 export type Method = keyof Methods;

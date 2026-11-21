@@ -1,7 +1,7 @@
 // The browser's side of the playground server: one WebSocket carrying zclaude's
 // events, terminal output and RPC replies.
 import type { Method, Methods, ZEvent } from '@zclaude/client/protocol';
-import { SessionStore } from '@zclaude/client/store';
+import { SessionStore, type SessionView } from '@zclaude/client/store';
 
 // The token from the URL authorizes the socket (the page itself sets a cookie too).
 export const token = new URLSearchParams(location.search).get('t') ?? '';
@@ -61,8 +61,7 @@ export function connect(): void {
     switch (data.type) {
       case 'replay':
         resetStore();
-        for (const event of data.events as ZEvent[]) store.apply(event);
-        if (data.exited !== null && data.exited !== undefined) store.apply({ method: 'exit', params: { seq: 0, code: data.exited } });
+        store.restore(data.view as SessionView);
         break;
       case 'restarted':
         resetStore();
@@ -72,7 +71,8 @@ export function connect(): void {
         store.apply(data.event as ZEvent);
         break;
       case 'exited':
-        store.apply({ method: 'exit', params: { seq: 0, code: data.code } });
+        // zclaude's `exit` event normally came first; this covers it dying without one.
+        if (store.view.state !== 'exited') store.apply({ method: 'exit', params: { seq: 0, code: data.code ?? -1 } });
         break;
       case 'term':
         for (const listener of termListeners) listener(fromBase64(data.data), Boolean(data.redraw));
