@@ -1,7 +1,7 @@
 // An optional, in-memory store for consumers that want the session as one value,
 // such as a UI. zclaude itself keeps nothing; this is one way a consumer can.
 // Browser-safe: no Node imports.
-import type { DialogInfo, DialogStatus, DialogUpdate, Entry, Meta, SessionState, Snapshot, ZEvent } from './protocol.ts';
+import type { Activity, AgentInfo, BackgroundTask, DialogInfo, DialogStatus, DialogUpdate, Entry, Meta, SessionState, Snapshot, TurnEnd, Usage, ZEvent } from './protocol.ts';
 
 export interface StreamView {
   message_id?: string;
@@ -13,6 +13,7 @@ export interface StreamView {
   main?: boolean;
   in_transcript?: boolean;
   stop_reason?: string;
+  usage?: Usage;
   blocks: Array<{ index: number; type: string; name?: string; text: string; started_at?: number; ended_at?: number }>;
 }
 
@@ -39,6 +40,14 @@ export interface SessionView {
   prompts: Record<string, PromptView>;
   dialogs: Record<string, DialogView>;
   term: { cols: number; rows: number };
+  activity: Activity;
+  /** The turn in progress. */
+  turn: { turn: number; claude_prompt_id?: string; started_at: number } | null;
+  /** How the last turn ended. */
+  lastTurn: TurnEnd | null;
+  tasks: BackgroundTask[];
+  /** Subagents running now, by id. */
+  agents: Record<string, AgentInfo>;
   exitCode?: number;
   exitSignal?: string;
   seq: number;
@@ -68,6 +77,11 @@ export class SessionStore {
   #prompts: Record<string, PromptView> = {};
   #dialogs: Record<string, DialogView> = {};
   #term = { cols: 0, rows: 0 };
+  #activity: Activity = { activity: 'starting', since: 0 };
+  #turn: SessionView['turn'] = null;
+  #lastTurn: TurnEnd | null = null;
+  #tasks: BackgroundTask[] = [];
+  #agents: Record<string, AgentInfo> = {};
   #exitCode?: number;
   #exitSignal?: string;
   #seq = 0;
@@ -87,6 +101,10 @@ export class SessionStore {
     this.#meta = { ...this.#meta, ...snapshot.meta };
     this.#term = snapshot.term;
     this.#seq = Math.max(this.#seq, snapshot.seq);
+    if (snapshot.activity) this.#activity = snapshot.activity;
+    if (snapshot.turn !== undefined) this.#turn = snapshot.turn;
+    if (snapshot.tasks) this.#tasks = snapshot.tasks;
+    if (snapshot.agents) this.#agents = Object.fromEntries(snapshot.agents.map((agent) => [agent.agent_id, agent]));
     const dialogs = { ...this.#dialogs };
     for (const dialog of snapshot.dialogs) dialogs[dialog.id] = { ...dialog };
     this.#dialogs = dialogs;
@@ -101,6 +119,7 @@ export class SessionStore {
         status: stream.status,
         started_at: stream.started_at,
         main: stream.main,
+        usage: stream.usage,
         blocks: stream.blocks.map((block) => ({ ...block })),
       };
     }
@@ -118,6 +137,11 @@ export class SessionStore {
     this.#prompts = view.prompts;
     this.#dialogs = view.dialogs;
     this.#term = view.term;
+    this.#activity = view.activity;
+    this.#turn = view.turn;
+    this.#lastTurn = view.lastTurn;
+    this.#tasks = view.tasks;
+    this.#agents = view.agents;
     this.#exitCode = view.exitCode;
     this.#exitSignal = view.exitSignal;
     this.#seq = view.seq;
@@ -162,8 +186,39 @@ export class SessionStore {
           main: p.main,
           in_transcript: p.in_transcript || s.in_transcript,
           started_at: p.started_at,
+          usage: p.usage,
         }));
         break;
+      case 'stream.usage':
+        this.#setStream(p.stream, (s) => ({ ...s, usage: p.usage }));
+        break;
+      case 'activity': {
+        const { seq: _, ...activity } = p;
+        this.#activity = activity;
+        break;
+      }
+      case 'turn.start':
+        this.#turn = { turn: p.turn, claude_prompt_id: p.claude_prompt_id, started_at: p.started_at };
+        break;
+      case 'turn.end': {
+        const { seq: _, ...end } = p;
+        this.#lastTurn = end;
+        if (this.#turn?.turn === p.turn) this.#turn = null;
+        break;
+      }
+      case 'tasks':
+        this.#tasks = p.tasks;
+        break;
+      case 'agent.start': {
+        const { seq: _, ...agent } = p;
+        this.#agents = { ...this.#agents, [p.agent_id]: agent };
+        break;
+      }
+      case 'agent.stop': {
+        const { [p.agent_id]: _gone, ...rest } = this.#agents;
+        this.#agents = rest;
+        break;
+      }
       case 'stream.block':
         this.#setStream(p.stream, (s) => ({ ...s, blocks: [...s.blocks, { index: p.index, type: p.type, name: p.name, text: '', started_at: p.started_at }] }));
         break;
@@ -213,6 +268,7 @@ export class SessionStore {
         this.#exitCode = p.code;
         this.#exitSignal = p.signal;
         this.#state = 'exited';
+        this.#activity = { activity: 'exited', since: Date.now() };
         break;
       default:
         return;
@@ -266,6 +322,11 @@ export class SessionStore {
       prompts: this.#prompts,
       dialogs: this.#dialogs,
       term: this.#term,
+      activity: this.#activity,
+      turn: this.#turn,
+      lastTurn: this.#lastTurn,
+      tasks: this.#tasks,
+      agents: this.#agents,
       exitCode: this.#exitCode,
       exitSignal: this.#exitSignal,
       seq: this.#seq,

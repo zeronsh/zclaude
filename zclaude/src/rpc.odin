@@ -7,6 +7,7 @@ package zclaude
 import "core:encoding/base64"
 import "core:encoding/json"
 import "core:fmt"
+import "core:os"
 import "core:strings"
 
 handle_message :: proc(cl: ^Client, line: string) {
@@ -61,7 +62,12 @@ handle_message :: proc(cl: ^Client, line: string) {
 	case "prompt.send":
 		transport := jstr(params, "transport")
 		if transport == "" do transport = "inproc"
-		p, err := hub_send_prompt(jstr(params, "text"), transport)
+		images, ierr := prompt_images(jarr(params, "images"))
+		if ierr != "" {
+			reply_error(cl, id, ierr)
+			return
+		}
+		p, err := hub_send_prompt(jstr(params, "text"), transport, images = images)
 		if err != "" {
 			reply_error(cl, id, err)
 			return
@@ -87,6 +93,12 @@ handle_message :: proc(cl: ^Client, line: string) {
 		else do reply_result(cl, id, res)
 	case "model.set":
 		res, err := rpc_set_model(jstr(params, "model"))
+		if err != "" do reply_error(cl, id, err)
+		else do reply_result(cl, id, res)
+	case "task.stop":
+		if err := hub_stop_task(cl, id, jstr(params, "id")); err != "" do reply_error(cl, id, err)
+	case "effort.set":
+		res, err := rpc_set_effort(jstr(params, "level"))
 		if err != "" do reply_error(cl, id, err)
 		else do reply_result(cl, id, res)
 	case "mode.set":
@@ -182,6 +194,63 @@ rpc_set_model :: proc(model_in: string) -> (string, string) {
 	_, err := hub_send_prompt(fmt.tprintf("/model %s", model), "inproc", command = true)
 	if err != "" do return "", err
 	return fmt.tprintf(`{{"model":"%s","status":"switching"}}`, model), ""
+}
+
+EFFORT_LEVELS :: []string{"low", "medium", "high", "xhigh", "max"}
+
+// `/effort LEVEL`, as typed at the terminal. Claude Code also saves it as the
+// default for new sessions, as it does there.
+rpc_set_effort :: proc(level_in: string) -> (string, string) {
+	h := hub()
+	level := strings.to_lower(strings.trim_space(level_in), context.temp_allocator)
+	known := false
+	for l in EFFORT_LEVELS do if l == level do known = true
+	if !known do return "", fmt.tprintf("unknown effort %q, expected low, medium, high, xhigh or max", level_in)
+	if !h.session_started do return "", "the session has not started yet"
+	if len(h.dialogs) > 0 do return "", "a dialog is open; answer it first"
+	if h.state != "idle" do return "", "cannot change effort while Claude is busy"
+	_, err := hub_send_prompt(fmt.tprintf("/effort %s", level), "inproc", command = true)
+	if err != "" do return "", err
+	return fmt.tprintf(`{{"effort":"%s","status":"switching"}}`, level), ""
+}
+
+IMAGE_TYPES :: []string{"png", "jpg", "jpeg", "gif", "webp"}
+
+// Images for a prompt: `{"path": "..."}` for a file, or `{"data": base64,
+// "media_type": "image/png"}`, which is written to a private file that lives as
+// long as the session.
+@(private = "file")
+prompt_images :: proc(list: Array) -> ([]string, string) {
+	out := make([dynamic]string, context.temp_allocator)
+	for item in list {
+		if path := jstr(item, "path"); path != "" {
+			ext := strings.to_lower(path[strings.last_index_byte(path, '.') + 1:], context.temp_allocator)
+			image := false
+			for t in IMAGE_TYPES do if t == ext do image = true
+			if !image do return nil, fmt.tprintf("%s is not a png, jpeg, gif or webp image", path)
+			if !os.is_file(path) do return nil, fmt.tprintf("no image file at %s", path)
+			append(&out, path)
+			continue
+		}
+		data := jstr(item, "data")
+		if data == "" do return nil, "each image is {\"path\": ...} or {\"data\": base64, \"media_type\": ...}"
+		ext := ""
+		switch jstr(item, "media_type") {
+		case "image/png", "": ext = "png"
+		case "image/jpeg": ext = "jpg"
+		case "image/gif": ext = "gif"
+		case "image/webp": ext = "webp"
+		case: return nil, fmt.tprintf("unsupported media_type %q", jstr(item, "media_type"))
+		}
+		bytes, err := base64.decode(data, allocator = context.temp_allocator)
+		if err != nil do return nil, "image data is not valid base64"
+		app.next_image += 1
+		path := fmt.aprintf("%s/%d.img-%d.%s", run_dir(), c_getpid(), app.next_image, ext)
+		if !write_private_file(path, string(bytes)) do return nil, "could not write the image file"
+		append(&app.temp_files, path)
+		append(&out, path)
+	}
+	return out[:], ""
 }
 
 @(private = "file")
@@ -329,8 +398,16 @@ clean_free_text :: proc(s: string) -> string {
 // What Claude receives for each question: its text mapped to the chosen labels and
 // any free text, comma separated, as the terminal dialog records them.
 build_answers :: proc(input: Value, answers: Value) -> (Object, string) {
+	out, _, err := build_answers_annotated(input, answers)
+	return out, err
+}
+
+// Also returns the annotations Claude Code records with answers: a question's
+// notes, and the preview of the option picked, as the terminal card sends them.
+build_answers_annotated :: proc(input: Value, answers: Value) -> (Object, Object, string) {
 	questions := jarr(input, "questions")
 	out := make(Object, context.temp_allocator)
+	notes := make(Object, context.temp_allocator)
 	#partial switch a in answers {
 	case Object:
 		for q in questions {
@@ -343,11 +420,11 @@ build_answers :: proc(input: Value, answers: Value) -> (Object, string) {
 				for p in x do if s, ok := p.(json.String); ok do append(&parts, string(s))
 				out[text] = json.String(strings.join(parts[:], ", ", context.temp_allocator))
 			case:
-				return nil, fmt.tprintf("no answer for %q", text)
+				return nil, nil, fmt.tprintf("no answer for %q", text)
 			}
 		}
 	case Array:
-		if len(a) != len(questions) do return nil, fmt.tprintf("expected %d answers, got %d", len(questions), len(a))
+		if len(a) != len(questions) do return nil, nil, fmt.tprintf("expected %d answers, got %d", len(questions), len(a))
 		for q, i in questions {
 			text := jstr(q, "question")
 			labels := make([dynamic]string, context.temp_allocator)
@@ -357,23 +434,33 @@ build_answers :: proc(input: Value, answers: Value) -> (Object, string) {
 				label, _ := sel.(json.String)
 				found := false
 				for l in labels do if l == string(label) do found = true
-				if !found do return nil, fmt.tprintf("%q has no option %q", text, string(label))
+				if !found do return nil, nil, fmt.tprintf("%q has no option %q", text, string(label))
 				append(&parts, string(label))
 			}
 			selected := len(parts)
 			other := clean_free_text(jstr(a[i], "other"))
 			if other != "" do append(&parts, other)
 			if jbool(q, "multiSelect") {
-				if len(parts) == 0 do return nil, fmt.tprintf("%q needs at least one answer", text)
+				if len(parts) == 0 do return nil, nil, fmt.tprintf("%q needs at least one answer", text)
 			} else if !((selected == 1 && other == "") || (selected == 0 && other != "")) {
-				return nil, fmt.tprintf("%q needs exactly one answer: one option or free text", text)
+				return nil, nil, fmt.tprintf("%q needs exactly one answer: one option or free text", text)
 			}
 			out[text] = json.String(strings.join(parts[:], ", ", context.temp_allocator))
+			annotation := make(Object, context.temp_allocator)
+			if note := clean_free_text(jstr(a[i], "notes")); note != "" do annotation["notes"] = json.String(note)
+			if selected == 1 {
+				for o in jarr(q, "options") {
+					if jstr(o, "label") == parts[0] {
+						if preview := jstr(o, "preview"); preview != "" do annotation["preview"] = json.String(preview)
+					}
+				}
+			}
+			if len(annotation) > 0 do notes[text] = annotation
 		}
 	case:
-		return nil, "answers is required: a list with {\"selected\": [labels], \"other\": text} per question, or an object of question to answer"
+		return nil, nil, "answers is required: a list with {\"selected\": [labels], \"other\": text} per question, or an object of question to answer"
 	}
-	return out, ""
+	return out, notes, ""
 }
 
 // Claude Code's own wording when a person refuses a call at the terminal, so a
@@ -455,12 +542,17 @@ rpc_dialog_respond :: proc(params: Value) -> (string, string) {
 			output = decision_json("deny", nil, "", message, interrupt)
 			status = "cancelled"
 		} else {
-			answer_map, err := build_answers(input, jget(params, "answers"))
-			if err != "" do return "", err
+			// `response` is the card's free reply to the questions as a whole.
+			response := strings.trim_space(jstr(params, "response"))
+			answer_map, annotations, err := build_answers_annotated(input, jget(params, "answers"))
+			if err != "" && !(response != "" && jget(params, "answers") == nil) do return "", err
+			if answer_map == nil do answer_map = make(Object, context.temp_allocator)
 			updated, _ := input.(Object)
 			copy_obj := make(Object, context.temp_allocator)
 			for k, v in updated do copy_obj[k] = v
 			copy_obj["answers"] = answer_map
+			if len(annotations) > 0 do copy_obj["annotations"] = annotations
+			if response != "" do copy_obj["response"] = json.String(response)
 			output = decision_json("allow", copy_obj, "", "", false)
 			status = "answered"
 			answers = to_json(answer_map, context.temp_allocator)

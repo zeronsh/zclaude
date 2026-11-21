@@ -54,6 +54,9 @@ Timer_Kind :: enum {
 	Memory_Timeout,
 	Settle,      // an answered card's wait for Claude Code to take it down ran out
 	Shutdown,    // the next step of a graceful shutdown
+	Turn_End,    // a stopped turn's end marker didn't come in time
+	Agent_Drain, // a finished subagent's transcript has had time to be written
+	Task_Step,   // one step of stopping a background task through /tasks
 }
 
 Input_Route :: enum {
@@ -94,6 +97,8 @@ App :: struct {
 	utf8_carry_n:  int,
 	hub:           Hub,
 	log_fd:        c.int,
+	temp_files:    [dynamic]string, // image files written for prompts, removed at exit
+	next_image:    int,
 }
 
 app: App

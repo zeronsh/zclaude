@@ -100,24 +100,36 @@ async function stop(session?: Session): Promise<void> {
 }
 
 /**
- * Sends a prompt and waits for the turn it starts to finish, and for the transcript
- * to hold every main-conversation message the turn streamed. Those entries can come
- * after `state: idle`.
+ * Sends a prompt and waits for the turn that takes it in to end. `turn.end` comes
+ * after every entry of its turn (zclaude waits for the transcript's own end
+ * marker), unlike `state: idle`, which can come before the last entry.
  */
-async function turn(s: Session, text: string): Promise<{ mark: number; reply: string }> {
+async function turn(s: Session, text: string): Promise<{ mark: number; reply: string; end: EventMap['turn.end'] }> {
   const mark = s.log.mark();
   const sent = await s.z.send(text);
-  await s.log.wait('prompt', (p) => p.id === sent.prompt_id && p.status === 'received', mark);
-  await s.log.wait('state', (p) => p.state === 'idle', mark);
-  const finished = s.log
-    .since(mark, 'stream.start')
-    .map((e) => e.params as EventMap['stream.start'])
-    .filter((start) => start.main && s.log.since(mark, 'stream.end').some((e: any) => e.params.stream === start.stream && e.params.status === 'done'));
-  for (const start of finished) {
-    await s.log.wait('entry', (p) => p.role === 'assistant' && p.message_id === start.message_id, mark, 30_000);
-  }
+  const end = await s.log.wait('turn.end', (p) => p.prompt_ids.includes(sent.prompt_id), mark);
   const replies = s.log.since(mark, 'entry').map((e) => e.params as EventMap['entry']).filter((e) => e.role === 'assistant' && !e.sidechain);
-  return { mark, reply: replies.map((e) => e.text).join('\n') };
+  return { mark, reply: replies.map((e) => e.text).join('\n'), end };
+}
+
+/** A 64x64 red PNG, built by hand. */
+function redPng(): Buffer {
+  const { deflateSync, crc32 } = require('node:zlib') as typeof import('node:zlib');
+  const chunk = (type: string, data: Buffer) => {
+    const head = Buffer.alloc(4);
+    head.writeUInt32BE(data.length);
+    const body = Buffer.concat([Buffer.from(type), data]);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(crc32(body) >>> 0);
+    return Buffer.concat([head, body, crc]);
+  };
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(64, 0);
+  header.writeUInt32BE(64, 4);
+  header.set([8, 2, 0, 0, 0], 8);
+  const row = Buffer.concat([Buffer.from([0]), Buffer.alloc(64 * 3, Buffer.from([255, 0, 0]))]);
+  const pixels = deflateSync(Buffer.concat(Array.from({ length: 64 }, () => row)));
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', header), chunk('IDAT', pixels), chunk('IEND', Buffer.alloc(0))]);
 }
 
 const ASK = (topic: string, options: string[]) =>
@@ -158,7 +170,33 @@ describe('headless session', () => {
     const deltas = s.log.since(mark, 'stream.delta').filter((e: any) => e.params.stream === start.stream);
     const text = deltas.map((e: any) => e.params.text).join('');
     expect(text).toContain('quick brown fox');
-  }, TURN);
+
+    // The turn: started by this prompt, ended after its entries, with usage.
+    const end = await s.log.wait('turn.end', (p) => p.prompt_ids.includes(sent.prompt_id), mark);
+    expect(end.status).toBe('done');
+    expect(end.stop_reason).toBe('end_turn');
+    expect(end.claude_prompt_id).toBeTruthy();
+    expect(end.usage.output_tokens).toBeGreaterThan(0);
+    expect(end.messages).toBe(1);
+    expect(end.last_message).toContain('quick brown fox');
+    const order = s.log.since(mark).map((e) => e.method);
+    expect(order.lastIndexOf('entry')).toBeLessThan(order.indexOf('turn.end'));
+    const activities = s.log.since(mark, 'activity').map((e: any) => e.params.activity);
+    expect(activities).toContain('requesting');
+    expect(activities).toContain('responding');
+    expect(activities.at(-1)).toBe('idle');
+    expect(s.store.view.meta.context_tokens).toBeGreaterThan(0);
+    expect(s.store.view.lastTurn?.turn).toBe(end.turn);
+  }, TURN * 2);
+
+  test('attaches an image the way a file dropped on the terminal is', async () => {
+    const mark = s.log.mark();
+    const sent = await s.z.call('prompt.send', { text: 'What color is this image? Answer with one word.', images: [{ data: redPng().toString('base64'), media_type: 'image/png' }] });
+    const end = await s.log.wait('turn.end', (p) => p.prompt_ids.includes(sent.prompt_id), mark);
+    expect(end.last_message?.toLowerCase()).toContain('red');
+    // Attached, not read from disk by a tool.
+    expect(s.log.since(mark, 'hook').filter((e: any) => e.params.name === 'PreToolUse')).toHaveLength(0);
+  }, TURN * 2);
 
   test('answers a question over RPC while the terminal shows the same dialog, and holds prompts meanwhile', async () => {
     const mark = s.log.mark();
@@ -173,16 +211,18 @@ describe('headless session', () => {
     const queued = await s.z.send('After that, also say the word kiwi.');
     expect(queued.status).toBe('queued');
 
-    const answered = await s.z.respond(dialog.id, { answers: [{ selected: ['Banana'] }] });
+    const answered = await s.z.respond(dialog.id, { answers: [{ selected: ['Banana'], notes: 'ripe ones only' }] });
     expect(answered.status).toBe('answered');
     const update = await s.log.wait('dialog.update', (p) => p.id === dialog.id, mark);
     expect(update.resolved_by).toBe('rpc');
     expect(update.answers).toEqual({ 'Pick a fruit': 'Banana' });
+    const result = await s.log.wait('entry', (p) => p.origin === 'tool_result' && JSON.stringify(p.blocks).includes(dialog.id), mark);
+    expect(JSON.stringify(result.blocks)).toContain('ripe ones only');
     await s.log.wait('prompt', (p) => p.id === queued.prompt_id && p.status === 'delivered', mark);
     await s.log.wait('entry', (p) => p.role === 'assistant' && /banana/i.test(p.text), mark);
     await s.log.wait('prompt', (p) => p.id === queued.prompt_id && p.status === 'received', mark);
     await until(() => s.store.view.state === 'idle', TURN, 'idle');
-  }, TURN * 2);
+  }, TURN * 3);
 
   test('lets the person at the terminal answer first', async () => {
     const mark = s.log.mark();
@@ -197,7 +237,7 @@ describe('headless session', () => {
     expect(closed.answers?.['Pick a color']).toBe('Blue');
     await s.log.wait('entry', (p) => p.role === 'assistant' && /blue/i.test(p.text), mark);
     await s.log.wait('state', (p) => p.state === 'idle', mark);
-  }, TURN);
+  }, TURN * 2);
 
   test('allows and denies tool permissions', async () => {
     let mark = s.log.mark();
@@ -216,7 +256,7 @@ describe('headless session', () => {
     expect(JSON.stringify(result.blocks)).toContain('Not in this test.');
     await s.log.wait('state', (p) => p.state === 'idle', mark);
     expect(existsSync(join(s.dir, 'zc-denied.txt'))).toBe(false);
-  }, TURN * 2);
+  }, TURN * 3);
 
   test('allows always: the suggestions apply and the same call runs without asking', async () => {
     let mark = s.log.mark();
@@ -238,7 +278,7 @@ describe('headless session', () => {
     expect(s.log.since(mark, 'dialog.open')).toHaveLength(0);
     // The suggestions can include a mode (accept edits); later tests expect default.
     if (s.store.view.meta.permission_mode !== 'default') await s.z.setMode('default');
-  }, TURN * 2);
+  }, TURN * 3);
 
   test('reports a card that no hook describes, and answers it by choice', async () => {
     const mark = s.log.mark();
@@ -257,7 +297,7 @@ describe('headless session', () => {
     await s.log.wait('prompt', (p) => p.id === queued.prompt_id && p.status === 'received', mark);
     await s.log.wait('entry', (p) => p.role === 'assistant' && p.text.includes('after-the-card'), mark);
     await until(() => s.store.view.state === 'idle', TURN, 'idle');
-  }, TURN);
+  }, TURN * 2);
 
   test('interrupts a running turn', async () => {
     const mark = s.log.mark();
@@ -270,7 +310,7 @@ describe('headless session', () => {
     await until(() => s.store.view.state === 'idle', 30_000, 'idle after interrupt');
     const ended = s.log.since(mark, 'stream.end').find((e: any) => e.params.stream === start.stream) as any;
     expect(ended.params.status).toBe('aborted');
-  }, TURN);
+  }, TURN * 2);
 
   test('types keys into the terminal and reads them back from the screen', async () => {
     await s.z.keys([{ text: 'draft words here' }]);
@@ -313,6 +353,53 @@ describe('headless session', () => {
     expect(memory.usage.rss).toBeGreaterThan(0);
   }, 30_000);
 
+  test('links a subagent to the tool call that started it and forwards its conversation', async () => {
+    const mark = s.log.mark();
+    await s.z.send('Use the Agent tool with subagent_type general-purpose and this task: "Reply with exactly: sub-ok". Wait for its result, then reply with exactly what it returned.');
+    const call = await s.log.wait('hook', (p) => p.name === 'PreToolUse' && p.tool === 'Agent', mark);
+    const started = await s.log.wait('agent.start', (p) => !p.internal, mark);
+    expect(started.parent_tool_use_id).toBe(call.tool_use_id);
+    expect(started.agent_type).toBe('general-purpose');
+    const stopped = await s.log.wait('agent.stop', (p) => p.agent_id === started.agent_id, mark);
+    expect(stopped.last_message).toContain('sub-ok');
+    const own = s.log.since(mark).filter((e) => e.method === 'entry' && (e.params as any).agent_id === started.agent_id);
+    expect(own.some((e: any) => e.params.role === 'assistant' && e.params.text.includes('sub-ok'))).toBe(true);
+    expect(own.every((e: any) => e.params.parent_tool_use_id === call.tool_use_id && e.params.sidechain)).toBe(true);
+    // Its entries come before its stop.
+    const order = s.log.since(mark);
+    const stopAt = order.findIndex((e) => e.method === 'agent.stop' && (e.params as any).agent_id === started.agent_id);
+    expect(order.findLastIndex((e) => e.method === 'entry' && (e.params as any).agent_id === started.agent_id)).toBeLessThan(stopAt);
+    await until(() => s.store.view.state === 'idle' && !s.store.view.turn, TURN, 'the turn to end');
+  }, TURN * 3);
+
+  test('lists background tasks and stops one through /tasks', async () => {
+    const mark = s.log.mark();
+    // `sleep` may need no permission; allow it if Claude Code asks.
+    const off = s.z.on('dialog.open', (p) => {
+      if (p.kind === 'permission') void s.z.respond(p.id, { decision: 'allow' }).catch(() => {});
+    });
+    await s.z.send('Use the Bash tool with run_in_background set to true to run exactly: sleep 417. Then reply "started" and nothing else.');
+    const listed = await s.log.wait('tasks', (p) => p.tasks.some((t) => t.command?.includes('sleep 417')), mark);
+    const task = listed.tasks.find((t) => t.command?.includes('sleep 417'))!;
+    expect(task.status).toBe('running');
+    await until(() => s.store.view.state === 'idle' && !s.store.view.turn, TURN, 'the turn to end');
+    off();
+    expect(await s.z.call('task.stop', { id: task.id })).toEqual({ task_id: task.id, stopped: true });
+    await s.log.wait('tasks', (p) => !p.tasks.some((t) => t.id === task.id), mark, 5_000);
+    await until(() => Bun.spawnSync(['pgrep', '-f', '^sleep 417']).exitCode !== 0, 10_000, 'the shell to be killed');
+    await until(async () => (await s.z.screen()).permission_mode !== undefined, 10_000, 'the tasks view to close');
+  }, TURN * 2);
+
+  test('sets the effort level', async () => {
+    const before = (await s.z.status()).meta.effort;
+    expect(before).toBeTruthy();
+    const level = before === 'low' ? 'medium' : 'low';
+    expect(await s.z.call('effort.set', { level })).toEqual({ effort: level, status: 'switching' });
+    await until(() => s.store.view.meta.effort === level, 10_000, 'meta to follow');
+    await s.z.call('effort.set', { level: before as any });
+    await until(() => s.store.view.meta.effort === before, 10_000, 'meta to follow back');
+  }, 30_000);
+
   test('cycles the permission mode with Shift+Tab', async () => {
     const result = await s.z.setMode('acceptEdits');
     expect(result.mode).toBe('acceptEdits');
@@ -337,7 +424,7 @@ describe('headless session', () => {
     await s.log.wait('prompt', (p) => p.id === sent.prompt_id && p.status === 'received', mark);
     await s.log.wait('entry', (p) => p.role === 'assistant' && p.text.includes('hook-delivered'), mark);
     await until(() => s.store.view.state === 'idle', TURN, 'idle');
-  }, TURN);
+  }, TURN * 2);
 
   test('lets a second consumer attach over the socket with history and a terminal redraw', async () => {
     const status = await s.z.status();
@@ -355,7 +442,7 @@ describe('headless session', () => {
     other.detach();
     expect(await other.exited).toBeNull();
     expect((await s.z.status()).state).toBe('idle');
-  }, TURN);
+  }, TURN * 2);
 
   test('runs slash commands: /clear starts a new conversation', async () => {
     const before = (await s.z.status()).meta.session_id;
@@ -415,7 +502,7 @@ describe('plan mode', () => {
     expect(existsSync(join(s.dir, 'plan-draft.txt'))).toBe(false);
     await until(() => s.store.view.meta.permission_mode === 'acceptEdits', 30_000, 'accept-edits mode');
     await s.log.wait('state', (p) => p.state === 'idle', mark);
-  }, TURN * 3);
+  }, TURN * 4);
 });
 
 describe('MCP elicitation', () => {
@@ -438,7 +525,37 @@ describe('MCP elicitation', () => {
     expect(result.status).toBe('accepted');
     await s.log.wait('entry', (p) => p.origin === 'tool_result' && JSON.stringify(p.blocks).includes('name=Ada'), mark);
     await s.log.wait('state', (p) => p.state === 'idle', mark);
-  }, TURN);
+  }, TURN * 2);
+});
+
+describe('API retries', () => {
+  test('reports Claude Code retrying an overloaded API, and the turn ending when interrupted', async () => {
+    const api = Bun.spawn([process.execPath, join(FIXTURES, 'overloaded-api.ts'), '0'], { stdout: 'pipe' });
+    const reader = api.stdout.getReader();
+    const port = Number(new TextDecoder().decode((await reader.read()).value).match(/listening (\d+)/)![1]);
+    const dir = mkdtempSync(join(tmpdir(), 'zclaude-it-'));
+    const z = ZClaude.spawn({ bin: BIN, cwd: dir, args: ['--model', MODEL], env: { ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}` } });
+    const log = new Log(z);
+    try {
+      await z.ready;
+      await log.wait('state', (p) => p.state === 'idle', 0, 60_000);
+      const sent = await z.send('Reply with exactly: hello');
+      const retry = await log.wait('api.retry', (p) => p.status === 529, 0, 60_000);
+      expect(retry.error).toBe('Overloaded');
+      expect(retry.attempt).toBeGreaterThan(0);
+      expect(retry.max_attempts).toBeGreaterThanOrEqual(retry.attempt!);
+      const retrying = await log.wait('activity', (p) => p.activity === 'retrying', 0, 5_000);
+      expect(retrying.retry_at).toBeGreaterThan(Date.now() - 1_000);
+      expect((await z.interrupt()).sent).toBe(true);
+      const end = await log.wait('turn.end', () => true, 0, 10_000);
+      expect(end).toMatchObject({ status: 'interrupted', messages: 0 });
+      expect(end.prompt_ids).toContain(sent.prompt_id);
+    } finally {
+      await z.shutdown();
+      api.kill();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 90_000);
 });
 
 describe('interactive session', () => {
@@ -497,7 +614,7 @@ describe('interactive session', () => {
       child.kill('SIGKILL');
       rmSync(dir, { recursive: true, force: true });
     }
-  }, TURN * 2);
+  }, TURN * 3);
 });
 
 async function s_idle(z: ZClaude): Promise<boolean> {

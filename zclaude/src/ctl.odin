@@ -11,9 +11,11 @@ CTL_USAGE :: `usage: zclaude ctl [--socket PATH] <command>
 
   list                          live sessions
   status                        state of the session
-  send [--hook] TEXT            send a prompt (in-process by default, or the rewake hook)
+  send [--hook] [--image PATH]... TEXT
+                                send a prompt (in-process by default, or the rewake hook)
   command /NAME [ARGS]          run a slash command, e.g. /compact
   model [NAME]                  show or switch the model
+  effort LEVEL                  low | medium | high | xhigh | max (also saved as the default)
   mode NAME                     default | acceptEdits | plan | auto | dontAsk | bypassPermissions
   interrupt                     end the turn, or refuse the open dialog
   answer DIALOG_ID JSON         e.g. '{"answers":[{"selected":["Green"]}]}', '{"decision":"allow"}',
@@ -22,6 +24,8 @@ CTL_USAGE :: `usage: zclaude ctl [--socket PATH] <command>
   screen                        the terminal screen as text
   subscribe [--term] [--history]  print events as JSON lines
   memory                        heap statistics, read inside Claude's process
+  tasks                         background tasks, as JSON
+  stop-task ID                  stop a background task
   shutdown [--force]            end the session (/exit, then SIGHUP, then SIGKILL)
   call METHOD [JSON]            any method
 
@@ -144,12 +148,21 @@ run_ctl :: proc(args_in: []string) -> int {
 	case "send":
 		transport := "inproc"
 		words := make([dynamic]string, context.temp_allocator)
-		for a in rest {
-			if a == "--hook" do transport = "hook"
-			else do append(&words, a)
+		images := strings.builder_make(context.temp_allocator)
+		for i := 0; i < len(rest); i += 1 {
+			a := rest[i]
+			if a == "--hook" {
+				transport = "hook"
+			} else if a == "--image" && i + 1 < len(rest) {
+				i += 1
+				if strings.builder_len(images) > 0 do strings.write_byte(&images, ',')
+				strings.write_string(&images, fmt.tprintf("{{\"path\":%s}}", json_string(realpath(rest[i], context.temp_allocator))))
+			} else {
+				append(&words, a)
+			}
 		}
 		method = "prompt.send"
-		params = fmt.tprintf("{{\"text\":%s,\"transport\":\"%s\"}}", json_string(strings.join(words[:], " ", context.temp_allocator)), transport)
+		params = fmt.tprintf("{{\"text\":%s,\"transport\":\"%s\",\"images\":[%s]}}", json_string(strings.join(words[:], " ", context.temp_allocator)), transport, strings.to_string(images))
 	case "command":
 		method = "command"
 		params = fmt.tprintf("{{\"text\":%s}}", json_string(strings.join(rest, " ", context.temp_allocator)))
@@ -197,6 +210,19 @@ run_ctl :: proc(args_in: []string) -> int {
 		if err != "" do return ctl_fail(err)
 		for line in jarr(v, "lines") do fmt.println(string(line.(json.String) or_else ""))
 		return 0
+	case "effort":
+		if len(rest) != 1 do return ctl_usage()
+		method = "effort.set"
+		params = fmt.tprintf("{{\"level\":%s}}", json_string(rest[0]))
+	case "tasks":
+		v, err := ctl_call(&c, "status", "")
+		if err != "" do return ctl_fail(err)
+		fmt.println(to_json(jget(v, "tasks"), context.temp_allocator))
+		return 0
+	case "stop-task":
+		if len(rest) != 1 do return ctl_usage()
+		method = "task.stop"
+		params = fmt.tprintf("{{\"id\":%s}}", json_string(rest[0]))
 	case "memory":
 		method = "memory"
 	case "shutdown":

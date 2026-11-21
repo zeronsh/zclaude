@@ -331,6 +331,13 @@ detects_permission_mode_from_footer :: proc(t: ^testing.T) {
 	screen_feed(s, transmute([]u8)string("\x1b[6;1H\x1b[2K  ? for shortcuts"))
 	mode, _ = detect_mode(s)
 	testing.expect_value(t, mode, "default")
+	// With background work the hints give way, and only the indicator says the mode.
+	screen_feed(s, transmute([]u8)string("\x1b[6;1H\x1b[2K  \u23f8 manual mode on \u00b7 1 shell \u00b7 \u2190 for agents"))
+	mode, _ = detect_mode(s)
+	testing.expect_value(t, mode, "default")
+	screen_feed(s, transmute([]u8)string("\x1b[6;1H\x1b[2K  \u23f5\u23f5 auto mode on \u00b7 1 shell"))
+	mode, _ = detect_mode(s)
+	testing.expect_value(t, mode, "auto")
 	screen_feed(s, transmute([]u8)string("\x1b[2J"))
 	_, ok = detect_mode(s)
 	testing.expect(t, !ok, "no footer, no guess")
@@ -869,4 +876,208 @@ interrupt_sends_esc_only_during_a_turn :: proc(t: ^testing.T) {
 	hook_event(`{"hook_event_name":"UserPromptSubmit"}`)
 	testing.expect(t, strings.contains(rpc_interrupt(), `"esc"`))
 	testing.expect_value(t, hub().state, "idle")
+}
+
+// ---------- Turns, activity, subagents ----------
+
+activities :: proc(msgs: []Value) -> string {
+	parts := make([dynamic]string, context.temp_allocator)
+	for a in events_of(msgs, "activity") do append(&parts, jstr(a, "activity"))
+	return strings.join(parts[:], " ", context.temp_allocator)
+}
+
+@(test)
+a_turn_ends_after_its_entries_with_usage_and_tasks :: proc(t: ^testing.T) {
+	reset_app()
+	cap := capture()
+	path := temp_transcript("turn")
+	hook_event(fmt.tprintf(`{{"hook_event_name":"SessionStart","transcript_path":"%s","effort":{{"level":"high"}}}}`, path))
+	testing.expect_value(t, hub().effort, "high")
+	hook_event(`{"hook_event_name":"UserPromptSubmit","prompt_id":"cp1"}`)
+	stream_event(`{"stream":1,"type":"message_start","message_id":"m1","in_thread":true,"input_tokens":10,"cache_read_tokens":100,"cache_write_tokens":5,"output_tokens":1,"shape":{"tools":"t","system":"s"}}`)
+	stream_event(`{"stream":1,"type":"content_block_start","index":0,"block_type":"thinking"}`)
+	stream_event(`{"stream":1,"type":"content_block_start","index":1,"block_type":"text"}`)
+	stream_event(`{"stream":1,"type":"message_delta","output_tokens":42,"stop_reason":"end_turn"}`)
+	stream_event(`{"stream":1,"type":"message_stop"}`)
+	hook_event(`{"hook_event_name":"Stop","last_assistant_message":"Hello","background_tasks":[{"id":"b1","type":"local_bash","status":"running","command":"sleep 9"}]}`)
+	msgs := drain(cap)
+	testing.expect_value(t, len(events_of(msgs, "turn.start")), 1)
+	testing.expect_value(t, jstr(events_of(msgs, "turn.start")[0], "claude_prompt_id"), "cp1")
+	// Not yet: the transcript hasn't caught up.
+	testing.expect_value(t, len(events_of(msgs, "turn.end")), 0)
+	testing.expect_value(t, len(jarr(events_of(msgs, "tasks")[0], "tasks")), 1)
+	testing.expect_value(t, activities(msgs), "idle requesting thinking responding idle")
+	testing.expect_value(t, hub().context_tokens, 157)
+	append_file(path, `{"type":"assistant","uuid":"u1","message":{"id":"m1","content":[{"type":"text","text":"Hello"}]}}` + "\n")
+	append_file(path, `{"type":"system","subtype":"turn_duration","durationMs":1234,"uuid":"u2"}` + "\n")
+	append_file(path, `{"type":"cost-state","totalCostUSD":0.0125}` + "\n")
+	hub_poll_transcript()
+	msgs = drain(cap)
+	// The entry, then the end of its turn.
+	entry_seq, end_seq: i64
+	for m in msgs {
+		seq, _ := jint(m, "params", "seq")
+		switch jstr(m, "method") {
+		case "entry": entry_seq = seq
+		case "turn.end": end_seq = seq
+		}
+	}
+	testing.expect(t, entry_seq > 0 && end_seq > entry_seq)
+	end := events_of(msgs, "turn.end")[0]
+	testing.expect_value(t, jstr(end, "status"), "done")
+	testing.expect_value(t, jstr(end, "stop_reason"), "end_turn")
+	testing.expect_value(t, jstr(end, "last_message"), "Hello")
+	duration, _ := jint(end, "duration_ms")
+	testing.expect_value(t, duration, 1234)
+	output, _ := jint(end, "usage", "output_tokens")
+	testing.expect_value(t, output, 42)
+	testing.expect_value(t, hub().cost_usd, "0.012500")
+	testing.expect(t, hub().turn == nil)
+}
+
+@(test)
+turns_end_without_a_marker_on_interrupt_failure_and_timeout :: proc(t: ^testing.T) {
+	reset_app()
+	cap := capture()
+	hook_event(`{"hook_event_name":"SessionStart"}`)
+	hook_event(`{"hook_event_name":"UserPromptSubmit"}`)
+	on_escape()
+	testing.expect(t, hub().turn.ending)
+	turn_timer(hub().turn.n)
+	end := events_of(drain(cap), "turn.end")[0]
+	testing.expect_value(t, jstr(end, "status"), "interrupted")
+
+	hook_event(`{"hook_event_name":"UserPromptSubmit"}`)
+	hook_event(`{"hook_event_name":"StopFailure","error":"rate_limit","error_details":"429 Too Many Requests"}`)
+	turn_timer(hub().turn.n)
+	failed := events_of(drain(cap), "turn.end")[0]
+	testing.expect_value(t, jstr(failed, "status"), "error")
+	testing.expect_value(t, jstr(failed, "error"), "rate_limit")
+
+	// A new prompt ends a turn still waiting for its marker.
+	hook_event(`{"hook_event_name":"UserPromptSubmit"}`)
+	hook_event(`{"hook_event_name":"Stop"}`)
+	hook_event(`{"hook_event_name":"UserPromptSubmit"}`)
+	msgs := drain(cap)
+	testing.expect_value(t, len(events_of(msgs, "turn.end")), 1)
+	testing.expect_value(t, len(events_of(msgs, "turn.start")), 2)
+}
+
+@(test)
+activity_follows_tools_compaction_and_retries :: proc(t: ^testing.T) {
+	reset_app()
+	cap := capture()
+	hook_event(`{"hook_event_name":"SessionStart"}`)
+	hook_event(`{"hook_event_name":"UserPromptSubmit"}`)
+	stream_event(`{"stream":1,"type":"message_start","message_id":"m1","in_thread":true}`)
+	stream_event(`{"stream":1,"type":"content_block_start","index":0,"block_type":"tool_use","tool":"Bash"}`)
+	hook_event(`{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"b1","tool_input":{}}`)
+	hook_event(`{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_use_id":"b1"}`)
+	// Retries show only on screen, in place of the spinner text.
+	screen_feed(app.screen, transmute([]u8)string("\x1b[20;1H\u273b 529 Overloaded \u00b7 retrying in 7s \u00b7 attempt 3/10\r\n"))
+	sync_retry()
+	sync_retry() // the same attempt again: nothing new
+	screen_feed(app.screen, transmute([]u8)string("\x1b[2J"))
+	sync_retry()
+	hook_event(`{"hook_event_name":"PreCompact"}`)
+	msgs := drain(cap)
+	testing.expect_value(t, activities(msgs), "idle requesting calling tool requesting retrying requesting compacting")
+	tool_events := events_of(msgs, "activity")
+	testing.expect_value(t, jstr(tool_events[3], "tool"), "Bash")
+	retry, _ := jint(tool_events[5], "retry_at")
+	testing.expect(t, retry > wall_ms() + 5000)
+	retries := events_of(msgs, "api.retry")
+	testing.expect_value(t, len(retries), 1)
+	status, _ := jint(retries[0], "status")
+	attempt, _ := jint(retries[0], "attempt")
+	testing.expect_value(t, status, 529)
+	testing.expect_value(t, attempt, 3)
+	testing.expect_value(t, jstr(retries[0], "error"), "Overloaded")
+}
+
+@(test)
+subagents_link_to_their_tool_call_and_forward_their_transcript :: proc(t: ^testing.T) {
+	reset_app()
+	cap := capture()
+	path := temp_transcript("parent")
+	base := strings.trim_suffix(path, ".jsonl")
+	os.make_directory_all(fmt.tprintf("%s/subagents", base))
+	sub := fmt.tprintf("%s/subagents/agent-a1.jsonl", base)
+	_ = os.write_entire_file(sub, transmute([]u8)string(""))
+	hook_event(fmt.tprintf(`{{"hook_event_name":"SessionStart","transcript_path":"%s"}}`, path))
+	hook_event(`{"hook_event_name":"PreToolUse","tool_name":"Agent","tool_use_id":"tA","tool_input":{"prompt":"x","subagent_type":"Explore"}}`)
+	hook_event(`{"hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Explore"}`)
+	hook_event(`{"hook_event_name":"SubagentStart","agent_id":"h1","agent_type":""}`)
+	started := events_of(drain(cap), "agent.start")
+	testing.expect_value(t, len(started), 2)
+	testing.expect_value(t, jstr(started[0], "parent_tool_use_id"), "tA")
+	testing.expect(t, jbool(started[1], "internal"))
+	append_file(sub, `{"type":"assistant","uuid":"s1","isSidechain":true,"message":{"id":"sm1","content":[{"type":"text","text":"found it"}]}}` + "\n")
+	hub_poll_transcript()
+	entry := events_of(drain(cap), "entry")[0]
+	testing.expect_value(t, jstr(entry, "agent_id"), "a1")
+	testing.expect_value(t, jstr(entry, "parent_tool_use_id"), "tA")
+	testing.expect(t, jbool(entry, "sidechain"))
+	hook_event(`{"hook_event_name":"PreToolUse","tool_name":"Read","agent_id":"a1","tool_use_id":"r1","tool_input":{}}`)
+	hook := events_of(drain(cap), "hook")[0]
+	testing.expect_value(t, jstr(hook, "parent_tool_use_id"), "tA")
+	hook_event(fmt.tprintf(`{{"hook_event_name":"SubagentStop","agent_id":"a1","agent_type":"Explore","agent_transcript_path":"%s","last_assistant_message":"found it"}}`, sub))
+	// Its last lines come after SubagentStop, so they are still read, then the stop.
+	testing.expect_value(t, len(events_of(drain(cap), "agent.stop")), 0)
+	append_file(sub, `{"type":"assistant","uuid":"s2","isSidechain":true,"message":{"id":"sm2","content":[{"type":"text","text":"done"}]}}` + "\n")
+	agent_drain(find_agent("a1").n)
+	msgs := drain(cap)
+	testing.expect_value(t, jstr(events_of(msgs, "entry")[0], "text"), "done")
+	stopped := events_of(msgs, "agent.stop")[0]
+	testing.expect_value(t, jstr(stopped, "last_message"), "found it")
+	testing.expect_value(t, len(hub().agents), 1)
+}
+
+@(test)
+images_paste_as_paths_and_effort_and_notes_reach_claude :: proc(t: ^testing.T) {
+	reset_app()
+	testing.expect(t, prompt_matches("what is this?", "[Image #1] what is this?"))
+	testing.expect(t, prompt_matches("", "[Image #1]"))
+	hook_event(`{"hook_event_name":"SessionStart"}`)
+	p, err := hub_send_prompt("what is this?", "inproc", images = []string{"/tmp/a b.png", "/tmp/c.png"})
+	testing.expect_value(t, err, "")
+	testing.expect_value(t, p.status, "delivered")
+	pastes := 0
+	for tm in app.timers do if tm.kind == .Input && strings.contains(tm.data, "\x1b[200~") do pastes += 1
+	testing.expect_value(t, pastes, 2) // the second image and the text follow the first
+	enter := false
+	for tm in app.timers do if tm.kind == .Enter do enter = tm.at >= now_ms() + 2 * IMAGE_PASTE_MS
+	testing.expect(t, enter)
+	_, herr := hub_send_prompt("x", "hook", images = []string{"/tmp/c.png"})
+	testing.expect(t, herr != "")
+
+	level, ok := parse_effort_output("<local-command-stdout>Set effort level to xhigh (saved as your default)</local-command-stdout>")
+	testing.expect(t, ok)
+	testing.expect_value(t, level, "xhigh")
+	_, eerr := rpc_set_effort("extreme")
+	testing.expect(t, eerr != "")
+
+	input, _ := parse_json(`{"questions":[{"question":"Pick","options":[{"label":"A","preview":"aaa"},{"label":"B"}]}]}`)
+	answers, _ := parse_json(`[{"selected":["A"],"notes":"because"}]`)
+	_, notes, aerr := build_answers_annotated(input, answers)
+	testing.expect_value(t, aerr, "")
+	testing.expect_value(t, jstr(notes, "Pick", "notes"), "because")
+	testing.expect_value(t, jstr(notes, "Pick", "preview"), "aaa")
+}
+
+@(test)
+the_tasks_view_is_read_for_stopping_a_task :: proc(t: ^testing.T) {
+	reset_app()
+	labels := []string{"sleep 301", "Sleep 301 seconds in background"}
+	screen_feed(app.screen, transmute([]u8)string("\x1b[12;1H▔▔▔▔▔▔▔▔▔▔▔▔\r\n  Background\r\n  2 shells\r\n  ❯ ● sleep 302   running\r\n    ● sleep 301   running\r\n      Earlier in this session (0)\r\n  ↑/↓ to navigate · x to stop · Enter to view · Esc to close\r\n"))
+	v := tasks_view(app.screen, labels)
+	testing.expect(t, v.open && !v.detail)
+	testing.expect_value(t, v.cursor, 0)
+	testing.expect_value(t, v.target, 1)
+	screen_feed(app.screen, transmute([]u8)string("\x1b[2J\x1b[12;1H▔▔▔▔▔▔▔▔▔▔▔▔\r\n  Sleep 301 seconds in background\r\n  Command:  sleep 301\r\n  ← to go back · x to stop · Enter/Space to close · Esc to close\r\n"))
+	d := tasks_view(app.screen, labels)
+	testing.expect(t, d.open && d.detail)
+	testing.expect_value(t, d.target, 0)
+	screen_feed(app.screen, transmute([]u8)string("\x1b[2J\x1b[22;1H❯ \x1b[24;1H  ? for shortcuts"))
+	testing.expect(t, !tasks_view(app.screen, labels).open)
 }

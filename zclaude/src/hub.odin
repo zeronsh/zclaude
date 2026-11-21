@@ -24,6 +24,7 @@ Prompt :: struct {
 	transport: string, // inproc | hook
 	status:    string, // queued | delivered | received | failed
 	command:   bool,   // sent by zclaude itself (model switch), not shown as a prompt
+	images:    [dynamic]string, // image files attached, pasted as paths ahead of the text
 }
 
 Dialog :: struct {
@@ -80,6 +81,9 @@ Live_Stream :: struct {
 	status:     string,
 	started_at: i64,
 	blocks:     [dynamic]^Live_Block,
+	usage:      Usage,
+	stop_reason: string,
+	counted:    bool, // added to its turn
 }
 
 Tail :: struct {
@@ -151,6 +155,20 @@ Hub :: struct {
 	settle:             Maybe(Settle),
 	// When a card with no dialog behind it was first seen, 0 if none is up.
 	card_since:         i64,
+	turn:               ^Turn,
+	next_turn:          int,
+	activity:           string, // static strings
+	activity_tool:      string,
+	activity_since:     i64,
+	retry_at:           i64,
+	effort:             string,
+	context_tokens:     i64,
+	cost_usd:           string, // a JSON number, from the transcript's cost-state
+	tasks:              string, // JSON array of background tasks
+	agents:             [dynamic]^Subagent,
+	next_agent:         int,
+	last_retry_attempt: int,
+	task_stop:          ^Task_Stop,
 }
 
 hub :: proc() -> ^Hub {
@@ -176,6 +194,7 @@ set_state :: proc(state: string) {
 	jw_str(&ev.w, "state", state)
 	jw_str(&ev.w, "previous", previous)
 	event_send(ev)
+	activity_for_state(state)
 }
 
 @(private = "file")
@@ -190,6 +209,22 @@ set_meta :: proc(key: string, field: ^string, value: string) {
 	if !replace_string(field, value) do return
 	ev := event("meta")
 	jw_str(&ev.w, key, value)
+	event_send(ev)
+}
+
+set_meta_int :: proc(key: string, field: ^i64, value: i64) {
+	if field^ == value do return
+	field^ = value
+	ev := event("meta")
+	jw_int(&ev.w, key, value)
+	event_send(ev)
+}
+
+// `value` is encoded JSON.
+set_meta_raw :: proc(key: string, field: ^string, value: string) {
+	if !replace_string(field, value) do return
+	ev := event("meta")
+	jw_raw(&ev.w, key, value)
 	event_send(ev)
 }
 
@@ -222,6 +257,9 @@ write_meta :: proc(w: ^Jw) {
 	jw_str(w, "permission_mode", h.permission_mode)
 	jw_bool(w, "agent_connected", agent() != nil)
 	jw_bool(w, "hook_waiter_armed", h.waiter_client != 0 && client_by_id(h.waiter_client) != nil)
+	jw_str(w, "effort", h.effort)
+	jw_int(w, "context_tokens", h.context_tokens)
+	jw_raw(w, "cost_usd", h.cost_usd)
 	jw_end_obj(w)
 }
 
@@ -289,6 +327,7 @@ write_snapshot :: proc(w: ^Jw) {
 		jw_bool(w, "main", s.main)
 		jw_str(w, "status", s.status)
 		jw_int(w, "started_at", s.started_at)
+		write_usage(w, "usage", s.usage)
 		jw_arr_key(w, "blocks")
 		for b in s.blocks {
 			jw_obj_item(w)
@@ -308,6 +347,26 @@ write_snapshot :: proc(w: ^Jw) {
 	jw_int(w, "cols", i64(app.screen.cols))
 	jw_int(w, "rows", i64(app.screen.rows))
 	jw_end_obj(w)
+	jw_obj_key(w, "activity")
+	write_activity_fields(w)
+	jw_end_obj(w)
+	if t := h.turn; t != nil {
+		jw_obj_key(w, "turn")
+		jw_int(w, "turn", i64(t.n))
+		if t.claude_prompt != "" do jw_str(w, "claude_prompt_id", t.claude_prompt)
+		jw_int(w, "started_at", t.started_at)
+		jw_end_obj(w)
+	} else {
+		jw_null(w, "turn")
+	}
+	jw_raw(w, "tasks", h.tasks != "" ? h.tasks : "[]")
+	jw_arr_key(w, "agents")
+	for a in h.agents {
+		jw_obj_item(w)
+		write_agent(w, a)
+		jw_end_obj(w)
+	}
+	jw_end_arr(w)
 	jw_end_obj(w)
 }
 
@@ -340,6 +399,7 @@ hook_common :: proc(params: Value) {
 	}
 	if id := jstr(params, "session_id"); id != "" do set_meta("session_id", &h.session_id, id)
 	if mode := jstr(params, "permission_mode"); mode != "" do set_meta("permission_mode", &h.permission_mode, mode)
+	if effort := jstr(params, "effort", "level"); effort != "" do set_meta("effort", &h.effort, effort)
 }
 
 hub_on_hook_event :: proc(params: Value) {
@@ -352,7 +412,10 @@ hub_on_hook_event :: proc(params: Value) {
 	jw_str(&ev.w, "name", name)
 	if tool != "" do jw_str(&ev.w, "tool", tool)
 	if id := jstr(params, "tool_use_id"); id != "" do jw_str(&ev.w, "tool_use_id", id)
-	if id := jstr(params, "agent_id"); id != "" do jw_str(&ev.w, "agent_id", id)
+	if id := jstr(params, "agent_id"); id != "" {
+		jw_str(&ev.w, "agent_id", id)
+		if parent := agent_parent(id); parent != "" do jw_str(&ev.w, "parent_tool_use_id", parent)
+	}
 	if t := jstr(params, "agent_type"); t != "" do jw_str(&ev.w, "agent_type", t)
 	if s := jstr(params, "source"); s != "" do jw_str(&ev.w, "source", s)
 	if n := jstr(params, "notification_type"); n != "" do jw_str(&ev.w, "notification_type", n)
@@ -360,6 +423,7 @@ hub_on_hook_event :: proc(params: Value) {
 	event_send(ev)
 
 	update_dialogs(name, tool, params)
+	track_turn(name, tool, params)
 	if name == "UserPromptSubmit" do h.prompt_submitted = true
 	if name == "PostModelSwitch" {
 		if model := jstr(params, "to_model"); model != "" {
@@ -729,6 +793,7 @@ hub_on_terminal_input :: proc(bytes: []byte) {
 on_escape :: proc() {
 	h := hub()
 	if h.state == "busy" {
+		turn_end_begin("interrupted")
 		set_state("idle")
 		for t in h.pending_tools do pending_tool_free(t)
 		clear(&h.pending_tools)
@@ -739,7 +804,13 @@ on_escape :: proc() {
 
 hub_poll_transcript :: proc() {
 	h := hub()
-	t := &h.tail
+	poll_tail(&h.tail, nil)
+	poll_agents()
+}
+
+// Reads what was appended to a transcript since the last poll: the session's own,
+// or a subagent's (`agent` set).
+poll_tail :: proc(t: ^Tail, agent: ^Subagent) {
 	if t.path == "" do return
 	if !t.has_fd {
 		fd := c_open(strings.clone_to_cstring(t.path, context.temp_allocator), O_RDONLY | O_CLOEXEC)
@@ -769,10 +840,28 @@ hub_poll_transcript :: proc() {
 	for i in 0 ..< len(data) {
 		if data[i] != '\n' do continue
 		historic := line_offset + i64(i) < t.catchup_end
-		handle_transcript_line(string(data[start:i]), historic)
+		line := string(data[start:i])
 		start = i + 1
+		if skip_record(line) do continue
+		if agent != nil do handle_agent_line(line, agent)
+		else do handle_transcript_line(line, historic)
 	}
 	append(&t.partial, ..data[start:])
+}
+
+// Transcript records that are never forwarded, told by the `type` they start with,
+// so the large ones (request blobs, data-flow records) are never parsed.
+skip_record :: proc(line: string) -> bool {
+	PREFIX :: `{"type":"`
+	if !strings.has_prefix(line, PREFIX) do return false
+	rest := line[len(PREFIX):]
+	end := strings.index_byte(rest, '"')
+	if end < 0 do return false
+	switch rest[:end] {
+	case "user", "assistant", "system", "attachment", "cost-state", "repl-mode":
+		return false
+	}
+	return true
 }
 
 // How often the transcript is read when no hook says something happened: often
@@ -781,7 +870,7 @@ hub_poll_transcript :: proc() {
 transcript_interval :: proc() -> i64 {
 	h := hub()
 	if h.tail.path == "" do return 1000
-	if h.state == "busy" || h.state == "awaiting_input" || len(h.in_flight) > 0 || len(h.streams) > 0 do return 100
+	if h.state == "busy" || h.state == "awaiting_input" || len(h.in_flight) > 0 || len(h.streams) > 0 || h.turn != nil || len(h.agents) > 0 do return 100
 	return 1000
 }
 
@@ -792,9 +881,58 @@ handle_transcript_line :: proc(line: string, historic: bool) {
 		set_meta_bool("code_mode", &h.code_mode, enabled)
 		return
 	}
+	// Records that aren't conversation, found cheaply before any parse.
+	if strings.contains(line, `"cost-state"`) {
+		if v, ok := parse_json(line); ok && jstr(v, "type") == "cost-state" {
+			#partial switch cost in jget(v, "totalCostUSD") {
+			case json.Float: set_meta_raw("cost_usd", &h.cost_usd, fmt.tprintf("%.6f", f64(cost)))
+			case json.Integer: set_meta_raw("cost_usd", &h.cost_usd, fmt.tprintf("%d", i64(cost)))
+			}
+		}
+		return
+	}
+	if !historic && strings.contains(line, `"turn_duration"`) {
+		if v, ok := parse_json(line); ok && jstr(v, "subtype") == "turn_duration" && !jbool(v, "isSidechain") {
+			duration, _ := jint(v, "durationMs")
+			turn_marker(duration)
+		}
+		return
+	}
+	if !historic && strings.contains(line, `"api_error"`) {
+		if v, ok := parse_json(line); ok && jstr(v, "subtype") == "api_error" && !jbool(v, "isSidechain") {
+			api_retry_from_transcript(v)
+		}
+	}
 	entry, ok := parse_line(line)
 	if !ok do return
 	publish_entry(&entry, historic)
+}
+
+// A subagent's conversation, forwarded as entries tagged with the agent and the
+// tool call that started it. It changes nothing about the main session's state.
+@(private = "file")
+handle_agent_line :: proc(line: string, a: ^Subagent) {
+	h := hub()
+	entry, ok := parse_line(line)
+	if !ok || entry.uuid in h.seen do return
+	h.seen[strings.clone(entry.uuid)] = true
+	entry.sidechain = true
+	emit_entry(&entry, "", false, nil, a)
+}
+
+// Claude Code records each retry it is about to make.
+@(private = "file")
+api_retry_from_transcript :: proc(v: Value) {
+	retry_in, _ := jint(v, "retryInMs")
+	attempt, _ := jint(v, "retryAttempt")
+	max_retries, _ := jint(v, "maxRetries")
+	ev := event("api.retry")
+	jw_int(&ev.w, "attempt", attempt)
+	jw_int(&ev.w, "max_retries", max_retries)
+	jw_int(&ev.w, "retry_in_ms", retry_in)
+	if e := jget(v, "error"); e != nil do jw_value(&ev.w, "error", e)
+	event_send(ev)
+	set_activity("retrying", retry_at = retry_in > 0 ? wall_ms() + retry_in : 0)
 }
 
 @(private = "file")
@@ -813,6 +951,7 @@ publish_entry :: proc(entry: ^Entry, historic: bool) {
 		}
 	}
 	if entry.origin == "command" {
+		if effort, ok := parse_effort_output(entry.text); ok do set_meta("effort", &h.effort, effort)
 		if model, ok := parse_model_switch_output(entry.text); ok {
 			set_meta("model", &h.model, model)
 			set_meta("model_pending", &h.model_pending, "")
@@ -852,6 +991,7 @@ publish_entry :: proc(entry: ^Entry, historic: bool) {
 			for p, i in h.in_flight {
 				if prompt_matches(p.text, entry.text) {
 					prompt_id = strings.clone(p.id, context.temp_allocator)
+					if !entry.sidechain do turn_took_prompt(p.id)
 					prompt_status(p, "received")
 					ordered_remove(&h.in_flight, i)
 					prompt_free(p)
@@ -863,6 +1003,8 @@ publish_entry :: proc(entry: ^Entry, historic: bool) {
 			for p, i in h.in_flight {
 				if command_matches(p.text, entry.text) {
 					prompt_id = strings.clone(p.id, context.temp_allocator)
+					// A command that starts a model turn (a skill, say) is part of it.
+					if h.turn != nil && !h.turn.ending && !p.command do append(&h.turn.prompts, strings.clone(p.id))
 					if !p.command do prompt_status(p, "received")
 					ordered_remove(&h.in_flight, i)
 					prompt_free(p)
@@ -876,15 +1018,19 @@ publish_entry :: proc(entry: ^Entry, historic: bool) {
 			cancel_open_dialogs()
 			for t in h.pending_tools do pending_tool_free(t)
 			clear(&h.pending_tools)
+			if !entry.sidechain do turn_end_begin("interrupted")
 			set_state("idle")
 		case "terminal", "external", "notification":
-			if !entry.sidechain do set_state("busy")
+			if !entry.sidechain {
+				turn_begin()
+				set_state("busy")
+			}
 		}
 	}
 	emit_entry(entry, prompt_id, historic, nil)
 }
 
-emit_entry :: proc(entry: ^Entry, prompt_id: string, historic: bool, only: ^Client) {
+emit_entry :: proc(entry: ^Entry, prompt_id: string, historic: bool, only: ^Client, agent: ^Subagent = nil) {
 	ev := event("entry", only = only)
 	jw_str(&ev.w, "uuid", entry.uuid)
 	jw_str(&ev.w, "session_id", entry.session_id)
@@ -897,6 +1043,10 @@ emit_entry :: proc(entry: ^Entry, prompt_id: string, historic: bool, only: ^Clie
 	if entry.message_id != "" do jw_str(&ev.w, "message_id", entry.message_id)
 	if prompt_id != "" do jw_str(&ev.w, "prompt_id", prompt_id)
 	jw_bool(&ev.w, "sidechain", entry.sidechain)
+	if agent != nil {
+		jw_str(&ev.w, "agent_id", agent.id)
+		if agent.parent != "" do jw_str(&ev.w, "parent_tool_use_id", agent.parent)
+	}
 	if historic do jw_bool(&ev.w, "historic", true)
 	event_send(ev)
 }
@@ -942,10 +1092,27 @@ normalize_prompt :: proc(text: string) -> string {
 }
 
 prompt_matches :: proc(sent, seen: string) -> bool {
-	seen_norm := normalize_prompt(seen)
+	seen_norm := normalize_prompt(strip_image_refs(seen))
 	if normalize_prompt(sent) == seen_norm do return true
 	t := truncate(sent)
 	return t != sent && normalize_prompt(t) == seen_norm
+}
+
+// Removes the prompt box's "[Image #N]" placeholders.
+strip_image_refs :: proc(text: string) -> string {
+	if !strings.contains(text, "[Image #") do return text
+	b := strings.builder_make(context.temp_allocator)
+	rest := text
+	for {
+		i := strings.index(rest, "[Image #")
+		if i < 0 do break
+		end := strings.index_byte(rest[i:], ']')
+		if end < 0 do break
+		strings.write_string(&b, rest[:i])
+		rest = rest[i + end + 1:]
+	}
+	strings.write_string(&b, rest)
+	return strings.to_string(b)
 }
 
 command_matches :: proc(sent, seen: string) -> bool {
@@ -959,6 +1126,8 @@ command_matches :: proc(sent, seen: string) -> bool {
 }
 
 prompt_free :: proc(p: ^Prompt) {
+	for i in p.images do delete(i)
+	delete(p.images)
 	delete(p.id)
 	delete(p.text)
 	delete(p.transport)
@@ -986,9 +1155,10 @@ Send_Error :: enum {
 // it is a real user turn. It waits while a dialog is open or the session is still
 // starting, instead of typing into a dialog. `hook` hands it to the armed rewake
 // waiter, which works without the agent.
-hub_send_prompt :: proc(text, transport: string, command := false) -> (^Prompt, string) {
+hub_send_prompt :: proc(text, transport: string, command := false, images: []string = nil) -> (^Prompt, string) {
 	h := hub()
-	if strings.trim_space(text) == "" do return nil, "prompt is empty"
+	if strings.trim_space(text) == "" && len(images) == 0 do return nil, "prompt is empty"
+	if len(images) > 0 && transport != "inproc" do return nil, "images go with the inproc transport"
 	if app.shutdown.stage != .None || app.child_exited do return nil, "the session is shutting down"
 	clean: string
 	switch transport {
@@ -1014,6 +1184,7 @@ hub_send_prompt :: proc(text, transport: string, command := false) -> (^Prompt, 
 	p.transport = strings.clone(transport)
 	p.status = strings.clone("queued")
 	p.command = command
+	for i in images do append(&p.images, strings.clone(i))
 	if transport == "hook" {
 		append(&h.hook_queue, p)
 		prompt_status(p, "queued")
@@ -1037,7 +1208,7 @@ flush_inproc_queue :: proc() {
 		p := h.inproc_queue[0]
 		ordered_remove(&h.inproc_queue, 0)
 		append(&h.in_flight, p)
-		feed_prompt(p.text)
+		feed_prompt(p.text, p.images[:])
 		prompt_status(p, "delivered")
 	}
 }
@@ -1061,9 +1232,8 @@ send_input :: proc(route: Input_Route, data: []byte) {
 }
 
 @(private = "file")
-feed_prompt :: proc(text: string) {
+feed_prompt :: proc(text: string, images: []string) {
 	h := hub()
-	paste := fmt.tprintf("\x1b[200~%s\x1b[201~", text)
 	h.prompt_submitted = false
 	h.feed_gen += 1
 	// A retried Enter is only safe where it can't do anything else. During a turn the
@@ -1071,10 +1241,36 @@ feed_prompt :: proc(text: string) {
 	// menu where Enter would pick an option.
 	retry := h.state == "idle" && !strings.has_prefix(strings.trim_left_space(text), "/")
 	route := input_route()
-	send_input(route, transmute([]u8)paste)
+	// An image goes in the way a terminal drops a file: its path, pasted on its own,
+	// which the prompt box turns into [Image #N]. Each gets a moment to load.
+	at: i64 = 0
+	pastes := make([dynamic]string, context.temp_allocator)
+	for path in images do append(&pastes, paste_path(path))
+	if strings.trim_space(text) != "" do append(&pastes, text)
+	for paste, i in pastes {
+		data := fmt.tprintf("\x1b[200~%s\x1b[201~", paste)
+		if i == 0 do send_input(route, transmute([]u8)data)
+		else do timer_add(at, .Input, data, route)
+		at += i < len(images) ? IMAGE_PASTE_MS : 0
+	}
 	// Enter must arrive separately, or the TUI treats it as part of the paste.
-	timer_add(KEY_DELAY_MS, .Enter, "", route, 0, h.feed_gen)
-	if retry do timer_add(KEY_DELAY_MS + ENTER_RETRY_MS, .Enter_Retry, "", route, 1, h.feed_gen)
+	timer_add(at + KEY_DELAY_MS, .Enter, "", route, 0, h.feed_gen)
+	if retry do timer_add(at + KEY_DELAY_MS + ENTER_RETRY_MS, .Enter_Retry, "", route, 1, h.feed_gen)
+}
+
+IMAGE_PASTE_MS :: 250
+
+// A path as the prompt box recognizes it: bare, or single-quoted if it needs to be.
+@(private = "file")
+paste_path :: proc(path: string) -> string {
+	plain := true
+	for c in transmute([]u8)path {
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '/' || c == '.' || c == '_' || c == '-'
+		if !ok do plain = false
+	}
+	if plain do return path
+	escaped, _ := strings.replace_all(path, "'", "'\\''", context.temp_allocator)
+	return fmt.tprintf("'%s'", escaped)
 }
 
 // How long a prompt's Enter waits for a card that opened under it.
@@ -1183,6 +1379,14 @@ hub_on_stream_event :: proc(e: Value) {
 			}
 			if cm, is_bool := jget(e, "code_mode").(json.Boolean); is_bool do set_meta_bool("code_mode", &h.code_mode, bool(cm))
 		}
+		s.usage.input, _ = jint(e, "input_tokens")
+		s.usage.output, _ = jint(e, "output_tokens")
+		s.usage.cache_read = cache_read
+		s.usage.cache_write = cache_write
+		if main {
+			turn_begin()
+			set_activity("requesting")
+		}
 		if id != "" {
 			if id not_in h.in_thread_by_msg do h.in_thread_by_msg[strings.clone(id)] = in_thread
 			if sh, has := shape.?; has {
@@ -1203,6 +1407,7 @@ hub_on_stream_event :: proc(e: Value) {
 		if previous != "" do jw_str(&ev.w, "previous_message_id", previous)
 		jw_bool(&ev.w, "in_transcript", id != "" && id in h.in_transcript)
 		jw_int(&ev.w, "started_at", s.started_at)
+		write_usage(&ev.w, "usage", s.usage)
 		event_send(ev)
 	case "content_block_start":
 		index, _ := jint(e, "index")
@@ -1213,6 +1418,13 @@ hub_on_stream_event :: proc(e: Value) {
 		b.text = strings.builder_make()
 		b.started_at = wall_ms()
 		append(&s.blocks, b)
+		if s.main {
+			switch b.type {
+			case "thinking", "redacted_thinking": set_activity("thinking")
+			case "text": set_activity("responding")
+			case "tool_use", "server_tool_use": set_activity("calling", b.name)
+			}
+		}
 		ev := event("stream.block")
 		jw_int(&ev.w, "stream", i64(n))
 		jw_int(&ev.w, "index", index)
@@ -1247,7 +1459,16 @@ hub_on_stream_event :: proc(e: Value) {
 		jw_int(&ev.w, "ended_at", ended)
 		event_send(ev)
 	case "message_delta":
+		if out, has_out := jint(e, "output_tokens"); has_out {
+			s.usage.output = max(s.usage.output, out)
+			ev := event("stream.usage")
+			jw_int(&ev.w, "stream", i64(n))
+			write_usage(&ev.w, "usage", s.usage)
+			event_send(ev)
+		}
 		if reason := jstr(e, "stop_reason"); reason != "" {
+			delete(s.stop_reason)
+			s.stop_reason = strings.clone(reason)
 			ev := event("stream.stop_reason")
 			jw_int(&ev.w, "stream", i64(n))
 			jw_str(&ev.w, "stop_reason", reason)
@@ -1255,8 +1476,10 @@ hub_on_stream_event :: proc(e: Value) {
 		}
 	case "message_stop":
 		end_stream(s, "done")
+		turn_add_message(s)
 	case "stream_end":
 		if !jbool(e, "stopped") do end_stream(s, "aborted")
+		turn_add_message(s)
 		delete_key(&h.streams, n)
 		stream_free(s)
 	}
@@ -1291,6 +1514,7 @@ stream_free :: proc(s: ^Live_Stream) {
 	delete(s.message_id)
 	delete(s.model)
 	delete(s.status)
+	delete(s.stop_reason)
 	free(s)
 }
 
@@ -1347,6 +1571,12 @@ hub_on_timer :: proc(t: Timer) {
 		// Nothing to do: the loop woke, and the next tick types what was held.
 	case .Shutdown:
 		shutdown_step()
+	case .Turn_End:
+		turn_timer(t.n)
+	case .Agent_Drain:
+		agent_drain(t.n)
+	case .Task_Step:
+		task_stop_step()
 	case .Memory_Timeout:
 		if req, has := h.memory_requests[t.n]; has {
 			delete_key(&h.memory_requests, t.n)
@@ -1377,6 +1607,7 @@ hub_after_tick :: proc() {
 			if len(d.modes) == 0 && wall_ms() - d.created_at < PLAN_MODES_WAIT_MS do h.screen_dirty = true
 		}
 		sync_terminal_card()
+		sync_retry()
 	}
 }
 
@@ -1731,6 +1962,11 @@ hub_on_child_exit :: proc(code: int, signal := 0) {
 	h.exited_code = code
 	hub_poll_transcript()
 	cancel_open_dialogs()
+	agents_drain_all()
+	if h.turn != nil {
+		if !h.turn.ending do turn_end_begin("exited")
+		turn_finish()
+	}
 	set_state("exited")
 }
 
@@ -1757,26 +1993,35 @@ signal_name :: proc(sig: int) -> string {
 // The permission mode as the footer shows it, e.g. "⏵⏵ accept edits on (shift+tab to
 // cycle)". Only trusted while the footer is visible.
 detect_mode :: proc(s: ^Screen) -> (string, bool) {
+	// Claude Code's indicators, each shown as "<indicator> on" (zr in its source).
+	INDICATORS :: [][2]string {
+		{"manualmodeon", "default"},
+		{"accepteditson", "acceptEdits"},
+		{"planmodeon", "plan"},
+		{"bypasspermissionson", "bypassPermissions"},
+		{"automodeon", "auto"},
+		{"don'taskon", "dontAsk"},
+	}
 	lines := screen_lines(s)
 	from := max(len(lines) - 8, 0)
-	saw_footer := false
 	for i := len(lines) - 1; i >= from; i -= 1 {
 		line := strings.to_lower(lines[i], context.temp_allocator)
 		compact, _ := strings.remove_all(line, " ", context.temp_allocator)
-		if strings.contains(compact, "shift+tab") || strings.contains(compact, "?forshortcuts") {
-			saw_footer = true
-		} else {
-			continue
-		}
-		switch {
-		case strings.contains(compact, "acceptedits"): return "acceptEdits", true
-		case strings.contains(compact, "planmode"): return "plan", true
-		case strings.contains(compact, "bypasspermissions"): return "bypassPermissions", true
-		case strings.contains(compact, "automode"): return "auto", true
-		case strings.contains(compact, "dontask"): return "dontAsk", true
+		compact, _ = strings.remove_all(compact, "\u2019", context.temp_allocator) // a curly apostrophe
+		for ind in INDICATORS do if strings.contains(compact, ind[0]) do return ind[1], true
+		// Older builds show only the hint in the default mode.
+		if strings.contains(compact, "?forshortcuts") do return "default", true
+		if strings.contains(compact, "shift+tab") {
+			switch {
+			case strings.contains(compact, "acceptedits"): return "acceptEdits", true
+			case strings.contains(compact, "planmode"): return "plan", true
+			case strings.contains(compact, "bypasspermissions"): return "bypassPermissions", true
+			case strings.contains(compact, "automode"): return "auto", true
+			case strings.contains(compact, "dontask"): return "dontAsk", true
+			}
+			return "default", true
 		}
 	}
-	if saw_footer do return "default", true
 	return "", false
 }
 

@@ -22,6 +22,69 @@ export interface Meta {
   /** The in-process agent that streams tokens and types prompts. */
   agent_connected: boolean;
   hook_waiter_armed: boolean;
+  /** The model's effort level, from Claude Code's hooks: low | medium | high | xhigh | max. */
+  effort: EffortLevel | '';
+  /**
+   * Tokens in the main conversation's context as of its last message (input +
+   * cache reads + cache writes + output). Compare with the model's context window.
+   */
+  context_tokens: number;
+  /** The session's cost so far in USD, as Claude Code records it; null until it does. */
+  cost_usd: number | null;
+}
+
+export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+export interface Usage {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
+}
+
+/**
+ * What the session is doing right now:
+ * - `starting`, `idle`, `exited`
+ * - `requesting`: a model call is on its way, no tokens yet
+ * - `thinking`, `responding`: tokens are arriving
+ * - `calling`: the model is writing a tool call (`tool` names it)
+ * - `tool`: a tool is running (`tool`)
+ * - `retrying`: an API call failed and Claude Code retries at `retry_at`
+ * - `compacting`
+ * - `waiting`: a dialog needs an answer
+ */
+export type ActivityKind = 'starting' | 'idle' | 'requesting' | 'thinking' | 'responding' | 'calling' | 'tool' | 'retrying' | 'compacting' | 'waiting' | 'exited';
+
+export interface Activity {
+  activity: ActivityKind;
+  tool?: string;
+  /** When this activity began (Unix ms). */
+  since: number;
+  /** `retrying`: when the next attempt goes out (Unix ms). */
+  retry_at?: number;
+}
+
+/** A background task, as Claude Code reports them with every Stop. */
+export interface BackgroundTask {
+  id: string;
+  /** shell | subagent | monitor | workflow | … */
+  type: string;
+  status: string;
+  description: string;
+  command?: string;
+  agent_type?: string;
+  server?: string;
+  tool?: string;
+  name?: string;
+}
+
+export interface AgentInfo {
+  agent_id: string;
+  agent_type: string;
+  /** The Agent/Task tool call that started it. */
+  parent_tool_use_id?: string;
+  /** Claude Code's own helpers (prompt suggestions, memory), which have no agent type. */
+  internal: boolean;
 }
 
 /**
@@ -104,6 +167,7 @@ export interface LiveStream {
   main: boolean;
   status: 'streaming' | 'done' | 'aborted';
   started_at: number;
+  usage: Usage;
   blocks: LiveBlock[];
 }
 
@@ -119,6 +183,12 @@ export interface Snapshot {
   prompts: PromptInfo[];
   streams: LiveStream[];
   term: { cols: number; rows: number };
+  activity: Activity;
+  /** The turn in progress, if any. */
+  turn: { turn: number; claude_prompt_id?: string; started_at: number } | null;
+  tasks: BackgroundTask[];
+  /** Subagents running now. */
+  agents: AgentInfo[];
 }
 
 export interface Entry {
@@ -134,8 +204,35 @@ export interface Entry {
   message_id?: string;
   prompt_id?: string;
   sidechain: boolean;
+  /** A subagent's entry: the agent, and the tool call that started it. */
+  agent_id?: string;
+  parent_tool_use_id?: string;
   /** Replayed from before this subscriber or this process. */
   historic?: boolean;
+}
+
+/** How a turn ended. Every `entry` of the turn comes before it. */
+export interface TurnEnd {
+  turn: number;
+  /** done, interrupted (Esc or an interrupt), error (StopFailure), or exited. */
+  status: 'done' | 'interrupted' | 'error' | 'exited';
+  /** The last main-conversation message's: end_turn, max_tokens, refusal, … */
+  stop_reason?: string;
+  /** Claude Code's id for the prompt that started the turn. */
+  claude_prompt_id?: string;
+  /** zclaude prompts the turn took in. */
+  prompt_ids: string[];
+  started_at: number;
+  ended_at: number;
+  /** Claude Code's own measure when the transcript has it. */
+  duration_ms: number;
+  /** Main-conversation model calls in the turn. */
+  messages: number;
+  usage: Usage;
+  /** StopFailure: the error kind (rate_limit, …) and details. */
+  error?: string;
+  error_details?: string;
+  last_message?: string;
 }
 
 /** Event params by method. Every params object also has `seq`. */
@@ -146,7 +243,9 @@ export interface EventMap {
   hook: { name: string; tool?: string; tool_use_id?: string; agent_id?: string; agent_type?: string; source?: string; notification_type?: string; message?: string };
   prompt: PromptInfo & { error?: string };
   entry: Entry;
-  'stream.start': { stream: number; message_id: string; model: string; main: boolean; in_thread: boolean; previous_message_id?: string; in_transcript: boolean; started_at: number };
+  'stream.start': { stream: number; message_id: string; model: string; main: boolean; in_thread: boolean; previous_message_id?: string; in_transcript: boolean; started_at: number; usage: Usage };
+  /** The running output count (and the input side) of a model call. */
+  'stream.usage': { stream: number; usage: Usage };
   'stream.block': { stream: number; index: number; type: string; name?: string; started_at: number };
   'stream.delta': { stream: number; index: number; text: string };
   'stream.block_stop': { stream: number; index: number; ended_at: number };
@@ -159,6 +258,14 @@ export interface EventMap {
   'term.resize': { cols: number; rows: number };
   /** Claude's exit code; 128 + n when signal n ended it, which `signal` names. */
   exit: { code: number; signal?: string };
+  'turn.start': { turn: number; claude_prompt_id?: string; started_at: number };
+  'turn.end': TurnEnd;
+  activity: Activity;
+  /** Claude Code is retrying a failed API call (read off its screen). */
+  'api.retry': { status?: number; error?: string; attempt?: number; max_attempts?: number; retry_in_ms: number };
+  'agent.start': AgentInfo;
+  'agent.stop': AgentInfo & { last_message?: string };
+  tasks: { tasks: BackgroundTask[] };
 }
 
 export type EventType = keyof EventMap;
@@ -170,11 +277,14 @@ export interface QuestionAnswer {
   selected?: string[];
   /** Free text, like the terminal's "Type something" field. */
   other?: string;
+  /** Notes on the selection, which Claude reads with the answer. */
+  notes?: string;
 }
 
 /** Answers or declines an AskUserQuestion dialog. */
 export type QuestionResponse =
-  | { answers: QuestionAnswer[] | Record<string, string> }
+  | { answers: QuestionAnswer[] | Record<string, string>; /** A free reply to the questions as a whole. */ response?: string }
+  | { response: string }
   | { decision: 'cancel'; message?: string; interrupt?: boolean };
 
 /** Decides a tool permission dialog. */
@@ -259,11 +369,22 @@ export interface Methods {
   status: [Record<string, never> | undefined, Snapshot];
   subscribe: [{ term?: boolean; history?: boolean } | undefined, Snapshot];
   unsubscribe: [undefined, true];
-  'prompt.send': [{ text: string; transport?: 'inproc' | 'hook' }, { prompt_id: string; status: string; transport: string }];
+  /**
+   * `images` attach like a file dropped on the terminal: a path, or base64 `data`
+   * (written to a private file for the session's lifetime). inproc only.
+   */
+  'prompt.send': [
+    { text: string; transport?: 'inproc' | 'hook'; images?: Array<{ path: string } | { data: string; media_type?: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' }> },
+    { prompt_id: string; status: string; transport: string },
+  ];
   command: [{ text: string }, { prompt_id: string; status: string }];
   interrupt: [undefined, { sent: boolean; via?: 'esc' | 'dialog'; state?: SessionState }];
   'dialog.respond': [{ id: string } & DialogResponse, DialogResult];
   'model.set': [{ model: string }, { model: string; status: 'switching' }];
+  /** `/effort LEVEL`. Claude Code also saves it as the default for new sessions. */
+  'effort.set': [{ level: EffortLevel }, { effort: EffortLevel; status: 'switching' }];
+  /** Stops a background task through /tasks, as a person would. */
+  'task.stop': [{ id: string }, { task_id: string; stopped: true }];
   'mode.set': [{ mode: PermissionMode }, { mode: PermissionMode }];
   keys: [{ keys?: Array<Key | { text: string } | { key: Key }>; text?: string; data?: string; delay_ms?: number }, true];
   'term.write': [{ data?: string; text?: string }, true];

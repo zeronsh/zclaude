@@ -11,11 +11,13 @@ package zclaude
 // to the real binary.
 //
 // The protocol is JSON-RPC 2.0, one object per line. Methods: status, subscribe,
-// unsubscribe, prompt.send, command, interrupt, dialog.respond, model.set, mode.set,
-// keys, term.write, term.resize, screen, memory, shutdown. Events (notifications,
-// params start with `seq`): ready, state, meta, hook, prompt, entry, stream.start,
-// stream.block, stream.delta, stream.block_stop, stream.stop_reason, stream.end,
-// stream.confirmed, dialog.open, dialog.update, term.output, term.resize, exit.
+// unsubscribe, prompt.send, command, interrupt, dialog.respond, model.set,
+// effort.set, mode.set, task.stop, keys, term.write, term.resize, screen, memory,
+// shutdown. Events (notifications, params start with `seq`): ready, state, meta,
+// activity, turn.start, turn.end, hook, prompt, entry, stream.start, stream.block,
+// stream.delta, stream.usage, stream.block_stop, stream.stop_reason, stream.end,
+// stream.confirmed, api.retry, agent.start, agent.stop, tasks, dialog.open,
+// dialog.update, term.output, term.resize, exit.
 // Dialog kinds: question, permission, plan, elicitation, terminal. Nothing is
 // stored: consumers keep what they want. The README documents every field, and
 // packages/client/src/protocol.ts types them; keep all three in step.
@@ -277,7 +279,7 @@ sweep_stale :: proc(dir: string) {
 		dot := strings.index_byte(f.name, '.')
 		if dot <= 0 do continue
 		kind := f.name[dot + 1:]
-		if kind != "sock" && kind != "agent.cjs" do continue
+		if kind != "sock" && kind != "agent.cjs" && !strings.has_prefix(kind, "img-") do continue
 		pid, ok := strconv.parse_int(f.name[:dot])
 		if !ok do continue
 		if !process_alive(pid) do c_unlink(strings.clone_to_cstring(f.fullpath, context.temp_allocator))
@@ -436,6 +438,7 @@ prepare :: proc(opts: Options, args_in: [dynamic]string) -> (p: Prepared, err: s
 cleanup_files :: proc() {
 	if app.listen_fd >= 0 do c_unlink(strings.clone_to_cstring(app.socket_path, context.temp_allocator))
 	if app.agent_path != "" do c_unlink(strings.clone_to_cstring(app.agent_path, context.temp_allocator))
+	for f in app.temp_files do c_unlink(strings.clone_to_cstring(f, context.temp_allocator))
 }
 
 run :: proc(raw_args: []string) -> int {
