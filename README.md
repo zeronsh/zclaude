@@ -493,3 +493,7 @@ hook's allow when it carries `updatedInput`, so zclaude always sends the input b
   `{option: N}` once the dialog is no longer held, or with `keys`.
 - Run on Linux x86_64; built (not run) for macOS arm64. Other Unixes need the constants in
   `zclaude/src/sys.odin` checked. Windows is not supported.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
