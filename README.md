@@ -54,7 +54,7 @@ bun install && bun run typecheck
 bun test --timeout 240000 zclaude/tests    # integration tests against real Claude Code (Haiku)
 ```
 
-Run on Linux x86_64 with Claude Code 2.1.330. It builds for macOS (arm64) too, where earlier versions were run.
+Unit and integration tests pass on Linux x86_64 and macOS arm64, both with Claude Code 2.1.330.
 
 zclaude finds `claude` on `PATH` at every launch, so it follows updates
 (`ZCLAUDE_CLAUDE_BIN` overrides). Started from inside another Claude Code session,
