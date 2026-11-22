@@ -1010,10 +1010,23 @@ subagents_link_to_their_tool_call_and_forward_their_transcript :: proc(t: ^testi
 	hook_event(`{"hook_event_name":"PreToolUse","tool_name":"Agent","tool_use_id":"tA","tool_input":{"prompt":"x","subagent_type":"Explore"}}`)
 	hook_event(`{"hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Explore"}`)
 	hook_event(`{"hook_event_name":"SubagentStart","agent_id":"h1","agent_type":""}`)
+	// A plugin's agent of the same type, with no tool call behind it, claims nothing.
+	hook_event(`{"hook_event_name":"SubagentStart","agent_id":"p1","agent_type":"Explore"}`)
 	started := events_of(drain(cap), "agent.start")
-	testing.expect_value(t, len(started), 2)
-	testing.expect_value(t, jstr(started[0], "parent_tool_use_id"), "tA")
-	testing.expect(t, jbool(started[1], "internal"))
+	testing.expect_value(t, len(started), 1) // only the internal one: the others wait for their metadata
+	testing.expect(t, jbool(started[0], "internal"))
+	// Claude Code's metadata file names the call.
+	_ = os.write_entire_file(fmt.tprintf("%s/subagents/agent-a1.meta.json", base), transmute([]u8)string(`{"toolUseId":"tA"}`))
+	hub_poll_transcript()
+	named := events_of(drain(cap), "agent.start")
+	testing.expect_value(t, len(named), 1)
+	testing.expect_value(t, jstr(named[0], "agent_id"), "a1")
+	testing.expect_value(t, jstr(named[0], "parent_tool_use_id"), "tA")
+	find_agent("p1").started_tick -= AGENT_PARENT_WAIT_MS
+	hub_poll_transcript()
+	plain := events_of(drain(cap), "agent.start")
+	testing.expect_value(t, jstr(plain[0], "agent_id"), "p1")
+	testing.expect(t, !jhas(plain[0], "parent_tool_use_id"))
 	append_file(sub, `{"type":"assistant","uuid":"s1","isSidechain":true,"message":{"id":"sm1","content":[{"type":"text","text":"found it"}]}}` + "\n")
 	hub_poll_transcript()
 	entry := events_of(drain(cap), "entry")[0]
@@ -1032,7 +1045,7 @@ subagents_link_to_their_tool_call_and_forward_their_transcript :: proc(t: ^testi
 	testing.expect_value(t, jstr(events_of(msgs, "entry")[0], "text"), "done")
 	stopped := events_of(msgs, "agent.stop")[0]
 	testing.expect_value(t, jstr(stopped, "last_message"), "found it")
-	testing.expect_value(t, len(hub().agents), 1)
+	testing.expect_value(t, len(hub().agents), 2)
 }
 
 @(test)

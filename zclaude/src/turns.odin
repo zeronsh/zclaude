@@ -61,6 +61,10 @@ Subagent :: struct {
 	id, type, parent: string,
 	stopping:         bool,
 	last_message:     string,
+	// agent.start waits (AGENT_PARENT_WAIT_MS at most) for Claude Code's metadata
+	// file, which names the tool call that started the agent.
+	announced:        bool,
+	started_tick:     i64,
 	// Claude Code's own helpers (prompt suggestions, memory) have no agent type.
 	internal:         bool,
 	tail:             Tail,
@@ -299,8 +303,19 @@ agent_start :: proc(params: Value) {
 	if h.tail.path != "" {
 		a.tail.path = fmt.aprintf("%s/subagents/agent-%s.jsonl", strings.trim_suffix(h.tail.path, ".jsonl"), id)
 	}
+	a.started_tick = now_ms()
 	append(&h.agents, a)
 	resolve_agent_parent(a)
+	if a.parent != "" || a.internal do announce_agent(a)
+}
+
+// Claude Code writes an agent's metadata file just after SubagentStart. An agent
+// with none (a plugin's own, say) has no tool call behind it.
+AGENT_PARENT_WAIT_MS :: 2000
+
+announce_agent :: proc(a: ^Subagent) {
+	if a.announced do return
+	a.announced = true
 	ev := event("agent.start")
 	write_agent(&ev.w, a)
 	event_send(ev)
@@ -320,6 +335,7 @@ agent_stop :: proc(params: Value) {
 		a.tail.path = strings.clone(path)
 	}
 	resolve_agent_parent(a)
+	announce_agent(a)
 	a.stopping = true
 	a.last_message = strings.clone(jstr(params, "last_assistant_message"))
 	if a.internal do agent_drain(a.n)
@@ -366,37 +382,26 @@ write_agent :: proc(w: ^Jw, a: ^Subagent) {
 	jw_bool(w, "internal", a.internal)
 }
 
-// The tool call that started a subagent: Claude Code's metadata file names it; until
-// that is written, the oldest unclaimed Agent call for the same agent type.
+// The tool call that started a subagent, from Claude Code's metadata file for it.
 @(private = "file")
 resolve_agent_parent :: proc(a: ^Subagent) {
-	h := hub()
-	if a.parent != "" || a.internal do return
-	if a.tail.path != "" {
-		meta := strings.concatenate({strings.trim_suffix(a.tail.path, ".jsonl"), ".meta.json"}, context.temp_allocator)
-		if data, err := os.read_entire_file(meta, context.temp_allocator); err == nil {
-			if v, ok := parse_json(string(data)); ok {
-				if id := jstr(v, "toolUseId"); id != "" {
-					a.parent = strings.clone(id)
-					return
-				}
-			}
-		}
-	}
-	outer: for t in h.pending_tools {
-		if t.name != "Agent" && t.name != "Task" do continue
-		input, _ := parse_json(t.input)
-		if jstr(input, "subagent_type") != a.type && !(a.type == "general-purpose" && jstr(input, "subagent_type") == "") do continue
-		for other in h.agents do if other != a && other.parent == t.id do continue outer
-		a.parent = strings.clone(t.id)
-		return
+	if a.parent != "" || a.internal || a.tail.path == "" do return
+	meta := strings.concatenate({strings.trim_suffix(a.tail.path, ".jsonl"), ".meta.json"}, context.temp_allocator)
+	data, err := os.read_entire_file(meta, context.temp_allocator)
+	if err != nil do return
+	if v, ok := parse_json(string(data)); ok {
+		if id := jstr(v, "toolUseId"); id != "" do a.parent = strings.clone(id)
 	}
 }
 
 poll_agents :: proc() {
 	for a in hub().agents {
 		if a.internal do continue
-		if a.parent == "" do resolve_agent_parent(a)
+		if !a.announced {
+			resolve_agent_parent(a)
+			if a.parent == "" && now_ms() - a.started_tick < AGENT_PARENT_WAIT_MS do continue
+			announce_agent(a)
+		}
 		poll_tail(&a.tail, a)
 	}
 }
