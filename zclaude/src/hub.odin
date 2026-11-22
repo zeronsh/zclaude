@@ -1038,7 +1038,7 @@ publish_entry :: proc(entry: ^Entry, historic: bool) {
 			for p, i in h.in_flight {
 				if i == match {
 					prompt_id = strings.clone(p.id, context.temp_allocator)
-					if !entry.sidechain do turn_took_prompt(p.id)
+					if !entry.sidechain do turn_took_prompt(p.id, entry.prompt_ref)
 					prompt_status(p, "received")
 					ordered_remove(&h.in_flight, i)
 					prompt_free(p)
@@ -1068,8 +1068,9 @@ publish_entry :: proc(entry: ^Entry, historic: bool) {
 			if !entry.sidechain do turn_end_begin("interrupted")
 			set_state("idle")
 		case "terminal", "external", "notification":
-			if !entry.sidechain {
-				turn_begin()
+			// A line of the turn in progress (by Claude Code's prompt id) isn't a new one.
+			if !entry.sidechain && !in_current_turn(entry.prompt_ref) {
+				turn_begin(entry.prompt_ref)
 				set_state("busy")
 			}
 		}
@@ -1249,7 +1250,13 @@ hub_send_prompt :: proc(text, transport: string, command := false, images: []str
 
 can_type_prompt :: proc() -> bool {
 	h := hub()
-	return h.session_started && len(h.dialogs) == 0 && h.state != "awaiting_input" && h.mode_task == nil && !app.child_exited && app.shutdown.stage == .None && !settling() && !card_on_screen(app.screen)
+	return h.session_started && len(h.dialogs) == 0 && h.state != "awaiting_input" && h.mode_task == nil && !app.child_exited && app.shutdown.stage == .None && !settling() && !card_on_screen(app.screen) && !draft_in_the_way()
+}
+
+// A draft in the prompt box holds zclaude's typing until it is sent or cleared. A
+// draft zclaude typed itself (a prompt waiting for its Enter) holds the next one too.
+draft_in_the_way :: proc() -> bool {
+	return composer_draft(app.screen)
 }
 
 flush_inproc_queue :: proc() {

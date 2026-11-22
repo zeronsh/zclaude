@@ -1176,3 +1176,59 @@ plan_feedback_goes_through_the_cards_own_field :: proc(t: ^testing.T) {
 	testing.expect_value(t, jstr(closed, "status"), "approved")
 	testing.expect_value(t, jstr(closed, "resolved_by"), "rpc")
 }
+
+@(test)
+a_draft_in_the_prompt_box_holds_typing :: proc(t: ^testing.T) {
+	reset_app()
+	hook_event(`{"hook_event_name":"SessionStart"}`)
+	box :: proc(content: string) {
+		rule := strings.repeat("─", 40, context.temp_allocator)
+		// The conversation above echoes an earlier prompt with the same glyph, and the
+		// upper rule can carry the session's name.
+		screen_feed(app.screen, transmute([]u8)fmt.tprintf("\x1b[2J\x1b[14;1H%s\r\n❯ an earlier prompt\r\n\x1b[20;1H%s fix-it ──\r\n\x1b[0m❯ %s\x1b[0m\r\n%s\r\n  ? for shortcuts", rule, rule, content, rule))
+	}
+	// The dim placeholder Claude Code shows in an empty box is not a draft.
+	box("\x1b[0;2mTry \"refactor <filepath>\"")
+	testing.expect(t, !composer_draft(app.screen))
+	box("\u00a0") // how Claude Code draws an empty box
+	testing.expect(t, !composer_draft(app.screen))
+	p, _ := hub_send_prompt("hello", "inproc")
+	testing.expect_value(t, p.status, "delivered")
+	box("half a thought")
+	testing.expect(t, composer_draft(app.screen))
+	q, _ := hub_send_prompt("later", "inproc")
+	testing.expect_value(t, q.status, "queued")
+	box("")
+	flush_inproc_queue()
+	testing.expect_value(t, q.status, "delivered")
+}
+
+@(test)
+a_failed_turns_late_lines_stay_in_it :: proc(t: ^testing.T) {
+	reset_app()
+	cap := capture()
+	path := temp_transcript("failed")
+	hook_event(fmt.tprintf(`{{"hook_event_name":"SessionStart","transcript_path":"%s"}}`, path))
+	p, _ := hub_send_prompt("hi", "inproc")
+	hook_event(`{"hook_event_name":"UserPromptSubmit","prompt":"hi","prompt_id":"cpx"}`)
+	hook_event(`{"hook_event_name":"StopFailure","error":"authentication_failed"}`)
+	// Claude Code writes the prompt and the error after StopFailure.
+	append_file(path, `{"type":"user","uuid":"u1","promptId":"cpx","message":{"content":"hi"}}` + "\n")
+	append_file(path, `{"type":"assistant","uuid":"u2","message":{"id":"m","content":[{"type":"text","text":"Please run /login"}]}}` + "\n")
+	hub_poll_transcript()
+	turn_timer(hub().turn.n)
+	msgs := drain(cap)
+	testing.expect_value(t, len(events_of(msgs, "turn.start")), 1)
+	ends := events_of(msgs, "turn.end")
+	testing.expect_value(t, len(ends), 1)
+	testing.expect_value(t, jstr(ends[0], "status"), "error")
+	testing.expect_value(t, jstr(jarr(ends[0], "prompt_ids")[0]), p.id)
+	order := make([dynamic]string, context.temp_allocator)
+	for m in msgs do append(&order, jstr(m, "method"))
+	last_entry, end_at := -1, -1
+	for m, i in order {
+		if m == "entry" do last_entry = i
+		if m == "turn.end" do end_at = i
+	}
+	testing.expect(t, last_entry < end_at)
+}

@@ -19,6 +19,8 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:unicode"
+import "core:unicode/utf8"
 
 // Stop has fired but the transcript's end marker hasn't come: end the turn anyway.
 TURN_END_GRACE_MS :: 2000
@@ -90,10 +92,18 @@ turn_begin :: proc(claude_prompt := "") {
 	event_send(ev)
 }
 
+// Whether a transcript line with this prompt id belongs to the turn in progress,
+// even one already ending: Claude Code can write a turn's lines after its Stop (a
+// failed turn's prompt and error come after StopFailure).
+in_current_turn :: proc(claude_prompt: string) -> bool {
+	t := hub().turn
+	return t != nil && claude_prompt != "" && t.claude_prompt == claude_prompt
+}
+
 // A prompt sent through zclaude reached the conversation.
-turn_took_prompt :: proc(id: string) {
+turn_took_prompt :: proc(id: string, claude_prompt := "") {
 	h := hub()
-	if h.turn == nil || h.turn.ending do turn_begin()
+	if !in_current_turn(claude_prompt) && (h.turn == nil || h.turn.ending) do turn_begin(claude_prompt)
 	append(&h.turn.prompts, strings.clone(id))
 }
 
@@ -545,6 +555,7 @@ hub_stop_task :: proc(cl: ^Client, req_id, id: string) -> string {
 	if found == nil do return fmt.tprintf("no background task %q (see the `tasks` event)", id)
 	if !can_type_prompt() && h.state != "busy" do return "the terminal is showing a dialog; answer it first"
 	if len(h.dialogs) > 0 || card_on_screen(app.screen) || settling() do return "the terminal is showing a dialog; answer it first"
+	if composer_draft(app.screen) do return "the prompt box has a draft in it"
 	ts := new(Task_Stop)
 	ts.client_id = cl.id
 	ts.req_id = strings.clone(req_id)
@@ -791,6 +802,7 @@ hub_set_effort_session :: proc(cl: ^Client, req_id, level: string) -> string {
 	if h.state != "idle" do return "cannot change effort while Claude is busy"
 	if h.effort_task != nil || h.task_stop != nil || h.mode_task != nil do return "another change is already running"
 	if len(h.dialogs) > 0 || card_on_screen(app.screen) || settling() do return "a dialog is open; answer it first"
+	if composer_draft(app.screen) do return "the prompt box has a draft in it"
 	if h.effort == level {
 		reply_result(cl, req_id, fmt.tprintf(`{{"effort":"%s","status":"set"}}`, level))
 		return ""
@@ -801,7 +813,7 @@ hub_set_effort_session :: proc(cl: ^Client, req_id, level: string) -> string {
 	t.target = strings.clone(level)
 	h.effort_task = t
 	route := input_route()
-	send_input(route, transmute([]u8)string("\x15\x1b[200~/model\x1b[201~"))
+	send_input(route, transmute([]u8)string("\x1b[200~/model\x1b[201~"))
 	timer_add(KEY_DELAY_MS, .Input, "\r", route)
 	timer_add(KEY_DELAY_MS + 300, .Effort_Step)
 	return ""
@@ -883,4 +895,57 @@ effort_on_screen :: proc(s: ^Screen) -> (level: string, open: bool) {
 		return "", true
 	}
 	return "", false
+}
+
+// ---------- The prompt box ----------
+
+// Whether the prompt box holds a draft: text after its "❯" that isn't the dim
+// placeholder Claude Code shows in an empty box. A person may be mid-sentence in an
+// interactive session, and anything typed now would join their draft.
+composer_draft :: proc(s: ^Screen) -> bool {
+	cells := buf(s)
+	lines := screen_lines(s)
+	// A rule: a line drawn across, possibly with a title in it ("──── name ─").
+	is_rule_line :: proc(line: string) -> bool {
+		t := strings.trim_space(line)
+		if t == "" do return false
+		first, _ := utf8.decode_rune_in_string(t)
+		if first < 0x2500 || first > 0x259F do return false
+		n := 0
+		for r in t do if r >= 0x2500 && r <= 0x259F do n += 1
+		return n >= 10
+	}
+	// The box sits between two rules just above the footer: find the lower rule,
+	// then read up to the upper one.
+	bottom := -1
+	for y := len(lines) - 1; y >= max(len(lines) - 8, 0); y -= 1 {
+		if is_rule_line(lines[y]) {
+			bottom = y
+			break
+		}
+	}
+	if bottom < 1 do return false
+	top := -1
+	for y := bottom - 1; y >= max(bottom - 12, 0); y -= 1 {
+		if is_rule_line(lines[y]) {
+			top = y
+			break
+		}
+	}
+	if top < 0 || !strings.has_prefix(strings.trim_left_space(lines[top + 1]), "❯") do return false
+	for row in top + 1 ..< bottom {
+		seen_prompt := row != top + 1
+		for x in 0 ..< s.cols {
+			c := cells[row * s.cols + x]
+			// Claude Code draws the empty box as "❯" and a no-break space.
+			if c.ch == 0 || unicode.is_space(c.ch) do continue
+			if !seen_prompt {
+				if c.ch == '❯' do seen_prompt = true
+				continue
+			}
+			// What a person typed; the placeholder in an empty box is dim.
+			if c.attr.flags & ATTR_DIM == 0 do return true
+		}
+	}
+	return false
 }
