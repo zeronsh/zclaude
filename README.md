@@ -145,7 +145,7 @@ with `seq`. `packages/client/src/protocol.ts` has every type below.
 | `interrupt` | | `{sent, via?: "esc" \| "dialog", state?}` |
 | `dialog.respond` | `id` and a [response](#dialogs) | `{dialog_id, status, mode?, prompt_id?}` |
 | `model.set` | `model` | `{model, status: "switching"}`; `meta` follows with the result |
-| `effort.set` | `level`: `low` \| `medium` \| `high` \| `xhigh` \| `max` | `{effort, status: "switching"}`; `meta.effort` follows |
+| `effort.set` | `level`: `low` \| `medium` \| `high` \| `xhigh` \| `max`, `save?: bool` | `{effort, status: "set"}` for this session; with `save`, `{effort, status: "switching"}` and `meta.effort` follows |
 | `task.stop` | `id` (from `tasks`) | `{task_id, stopped: true}` once its row has gone from /tasks |
 | `mode.set` | `mode` | `{mode}` once the footer shows it |
 | `keys` | `keys: [name \| {text} \| {key}]`, `delay_ms?` (60), or `text`, or `data` (base64) | `true` |
@@ -173,9 +173,11 @@ path on its own, which the prompt box turns into `[Image #N]`, then the text. `d
 that lives as long as the session. Claude receives the image itself, not a path to
 read.
 
-**Effort** is `/effort LEVEL` typed at the terminal; Claude Code also saves it as
-the default for new sessions, as it does there. `meta.effort` comes from the level
-every hook reports.
+**Effort** changes for this session only, the way the /model picker does it: zclaude
+opens the picker, moves the effort with ←/→ on the model already in use, and presses
+`s` ("use this session only"), reading the screen before each key. Nothing is
+saved. `save: true` types `/effort LEVEL` instead, which also makes it the default
+for new sessions, as it does at the terminal.
 
 **Stopping a task** does what a person does: zclaude opens `/tasks`, moves to the
 task's row, presses `x` and closes the view, reading the screen before each step.
@@ -213,13 +215,13 @@ its stdin or zclaude gets SIGTERM, SIGINT or SIGHUP.
 | `stream.usage` | `stream`, `usage` (the running output count, with the input side) |
 | `stream.stop_reason` | `stream`, `stop_reason` |
 | `stream.end` | `stream`, `status` (`done` \| `aborted`), `ended_at` |
-| `stream.confirmed` | `stream`, `message_id`: the transcript now holds this message. |
+| `stream.confirmed` | `stream`, `message_id`, `main?`, `query_source?`: the transcript now holds this message, and the request's record settles which conversation it was. |
 | `dialog.open` | A [dialog](#dialogs). |
 | `dialog.update` | `id`, `status`, and whichever changed: `held`, `touched`, `modes`, or how it closed: `resolved_by` (`rpc` \| `terminal`; absent when a turn or session ending closed it), `answers`. |
 | `term.output` | `data` (base64 terminal bytes), `redraw?`. Only for `subscribe({term: true})`. |
 | `term.resize` | `cols`, `rows` |
 | `turn.start` | `turn` (a number), `claude_prompt_id?` (Claude Code's id for the prompt), `started_at` |
-| `turn.end` | `turn`, `status` (`done` \| `interrupted` \| `error` \| `exited`), `stop_reason?`, `claude_prompt_id?`, `prompt_ids` (zclaude prompts it took in), `started_at`, `ended_at`, `duration_ms`, `messages` (main model calls), `usage`, `error?`, `error_details?`, `last_message?` |
+| `turn.end` | `turn`, `status` (`done` \| `interrupted` \| `error` \| `exited`), `stop_reason?`, `claude_prompt_id?`, `prompt_ids` (zclaude prompts it took in), `started_at`, `ended_at`, `duration_ms`, `messages` (main model calls), `usage`, `cost_usd?`, `error?`, `error_details?`, `last_message?` |
 | `activity` | `activity`, `tool?`, `since`, `retry_at?`: see [activity](#turns-and-activity) |
 | `api.retry` | `status?`, `error?`, `attempt?`, `max_attempts?`, `retry_in_ms`: Claude Code is retrying a failed API call |
 | `agent.start` | `agent_id`, `agent_type`, `parent_tool_use_id?` (the Agent call that started it), `internal` |
@@ -227,7 +229,8 @@ its stdin or zclaude gets SIGTERM, SIGINT or SIGHUP.
 | `tasks` | `tasks`: the background tasks (`id`, `type`, `status`, `description`, `command?`, `agent_type?`, …) |
 | `exit` | `code` (Claude's exit code, 128 + n for signal n), `signal?` (e.g. `"SIGHUP"`). Last, and sent to every control connection. |
 
-A subagent's entries carry `agent_id` and `parent_tool_use_id`, with `sidechain: true`.
+User entries carry `claude_prompt_id`, assistant entries `query_source`. A subagent's
+entries also carry `agent_id` and `parent_tool_use_id`, with `sidechain: true`.
 
 `usage` objects are `{input_tokens, output_tokens, cache_read_input_tokens,
 cache_creation_input_tokens}`.
@@ -256,7 +259,11 @@ session in progress.
     "hook_waiter_armed": true,     // a rewake hook is waiting for `hook` prompts
     "effort": "medium",
     "context_tokens": 41057,       // the main conversation's context, as of its last message
-    "cost_usd": null               // the session's cost, once Claude Code records it
+    "cost_usd": 0.0046,            // live, from Claude Code's status line (null before it reports)
+    "context": { "window_tokens": 1000000, "used_percentage": 4, "input_tokens": 40375, "output_tokens": 18 },
+    "rate_limits": { "seven_day": { "used_percentage": 71, "resets_at": 1795492800 } },
+    "thinking": true, "fast_mode": false,
+    "sources": { "hooks": true, "agent": true, "status_line": true, "transcript": true }
   },
   "activity": { "activity": "idle", "since": 1763000000000 },
   "turn": null,                    // or { "turn": 3, "claude_prompt_id": "…", "started_at": … }
@@ -297,9 +304,26 @@ screen.
   suggestions and the like) come as `internal: true` and aren't forwarded.
 - **Background tasks**: `tasks` comes with every Stop and SubagentStop, and when
   `task.stop` removes one.
-- `meta.context_tokens` sizes the main conversation after each of its messages, and
-  `meta.cost_usd` is the session's cost once Claude Code records it (at the end of
-  the session in this version).
+- **Claude Code's own accounting** comes from its status line, a documented
+  interface it feeds after every message: `meta.cost_usd` (live), `meta.context`
+  (the window's size and how much is used), `meta.rate_limits` (the plan's
+  five-hour and weekly limits, with reset times), effort, model and thinking.
+  `turn.end.cost_usd` is the turn's share, taken after the status line has reported
+  on the turn's last message. zclaude installs its own status-line command and runs
+  the person's own status line, if they have one, on the same input, so the terminal
+  looks the same.
+- **Claude Code's own ids** tie everything together: a prompt zclaude typed is bound
+  to the `prompt_id` UserPromptSubmit reports for its text, and every transcript line
+  carries one, so prompts, entries and turns are matched by id (text matching is
+  only the fallback, for prompts queued mid-turn and the rewake hook's). Assistant
+  lines name the request they came from, and Claude Code records each request's
+  source before sending it, so every entry carries `query_source`
+  (`repl_main_thread`, `agent:builtin:Explore`, …) and `stream.confirmed` settles
+  whether a stream was the main conversation.
+- `meta.context_tokens` sizes the main conversation after each of its messages,
+  from the stream itself.
+- `meta.sources` says which sources are live (`hooks`, `agent`, `status_line`,
+  `transcript`), so a consumer knows at once if one has stopped.
 
 ### Dialogs
 
@@ -328,9 +352,11 @@ screen.
 
 A `terminal` dialog's `input` is `{text, options}`: the card's lines as shown and
 its choice labels. One opens when a selection card has been on screen for 0.6 s with
-no hook behind it. Any dialog that is no longer `held` also takes `{option: N}`,
-which picks that choice on its card. It then closes when Claude Code reports the
-tool's outcome, and the result's status is `sent`.
+no hook behind it. Any dialog also takes `{option: N}`, which picks that choice on
+its card the way a person would, including choices a hook can't express (a plan's
+"clear context", Ultraplan). Claude Code then drops the held hook, the dialog closes
+when it reports the tool's outcome (with `resolved_by: "rpc"`), and the result's
+status is `sent`.
 
 `allow_always` applies the dialog's `suggestions`, which is what the card's "Yes, and
 always allow ..." choice does. Claude Code decides what they are (rules,
@@ -347,15 +373,17 @@ depend on what the session allows: "Yes, and use auto mode" when auto mode is
 available, otherwise "Yes, auto-accept edits", then "Yes, manually approve edits",
 and bypass permissions when enabled). `approve` without `mode` takes the first, as
 Enter would. `plan` replaces the plan with an edited one. `message` is feedback with
-the approval (the card's "shift+tab to approve with this feedback"). A hook can't
-attach that, so it follows as the next prompt and its `prompt_id` is in the result.
+the approval, given exactly as the card takes it: zclaude types it into the card's
+"Tell Claude what to change" field and presses Shift+Tab ("approve with this
+feedback"), which approves into the card's first choice, so Claude reads the
+feedback with the approval. The result's status is `sent`, and `dialog.update`
+confirms.
 `reject` with a `message` is "Tell Claude what to change": Claude stays in plan mode
 and revises. `interrupt` also ends the turn, like Esc on the card. If the card
 offers no approve choice (a plan Claude Code can't show), `modes` stays empty.
 
 `interrupt` with a dialog open refuses every held dialog and ends the turn.
-A dialog that is no longer `held` can only be answered at the terminal (read it
-with `screen`, answer with `keys`).
+A dialog that is no longer `held` is answered on its card with `{option: N}`.
 
 ### Ordering
 
@@ -399,8 +427,9 @@ stream-json harness maps to:
 | stream-json | zclaude |
 | --- | --- |
 | user message line on stdin | `prompt.send` (with `images`) |
-| `result` frame (end of turn, usage, stop reason, error) | `turn.end` |
-| per-message `command_lifecycle` | `prompt` statuses (`queued` → `delivered` → `received`) and `turn.end.prompt_ids` |
+| `result` frame (end of turn, usage, cost, stop reason, error) | `turn.end` |
+| `rate_limit_info` | `meta.rate_limits` |
+| per-message `command_lifecycle` | `prompt` statuses (`queued` → `delivered` → `received`), bound to Claude Code's `prompt_id` |
 | assistant/user frames | `entry`, and `stream.*` for tokens |
 | `parent_tool_use_id` on subagent frames | `agent_id` and `parent_tool_use_id` on entries and hooks; `agent.start`/`agent.stop` |
 | `can_use_tool` control request | `dialog.open` / `dialog.respond` |
@@ -469,30 +498,30 @@ Tools that need a person, such as AskUserQuestion and ExitPlanMode, only accept 
 hook's allow when it carries `updatedInput`, so zclaude always sends the input back
 (with the answers, or the edited plan).
 
-## Known limits
+## What it rests on
 
-- zclaude relies on Claude Code internals that are not a documented API: the hook
-  decision schema beyond the documented fields, the transcript format, the TUI's
-  wording (the permission-mode footer and the plan card's choices are read off the
-  screen), the config keys that skip start-up modals, and the in-process hooks in
-  `agent.js` (`ReadableStream.getReader`, `JSON.stringify`, `process.stdin.push`).
-  A Claude Code update can change any of these. Everything degrades rather than
-  breaks: without the agent, prompts go through `keys` and the `hook` transport and
-  there are no token streams; unknown screens can still be read and answered with
-  `screen` and `keys`. To find undocumented behavior, run `strings -n 8` on the
-  resolved `claude` binary (a Bun single executable) and grep.
-- Some of what zclaude reports is read off the screen because Claude Code shows it
-  nowhere else: the permission mode, the plan card's choices, other cards, API
-  retries and the /tasks view. Claude Code's API calls don't pass through the
-  agent's hooks in this version, so rate-limit headers aren't reported; a rate
-  limit that ends a turn comes as `turn.end` with `status: "error"`.
-- `effort.set` saves the level as the default for new sessions, as `/effort` does.
-- A plan approved with feedback gets it as the next prompt, not on the approval
-  itself (a hook can't attach it). The card's "clear context" and Ultraplan choices
-  start new conversations, which a hook can't ask for: pick them on the card with
-  `{option: N}` once the dialog is no longer held, or with `keys`.
-- Run on Linux x86_64; built (not run) for macOS arm64. Other Unixes need the constants in
-  `zclaude/src/sys.odin` checked. Windows is not supported.
+Each piece of zclaude stands on the most authoritative source Claude Code has for
+it, and says which are live (`meta.sources`):
+
+| Source | Gives | Documented |
+| --- | --- | --- |
+| Hooks | lifecycle, tools, dialogs (held), prompt ids, permission mode, effort, background tasks | yes |
+| Status line | cost, context window, rate limits, effort, model | yes |
+| Transcript | the conversation, request sources, prompt ids, the end-of-turn marker | file format |
+| Agent inside Claude's process | tokens and per-message usage, typing prompts, start-up modals | no (Node APIs only) |
+| Screen | what only the terminal shows: cards no hook describes, the plan card's choices, API retry countdowns, the /tasks and /model views | no (Claude Code's own wording) |
+
+What only the screen shows is read from Claude Code's own strings (its mode
+indicator table, card layouts), checked against the running version by the
+integration suite. When a source goes quiet, the rest carry on: without the agent
+there are no token streams and prompts go through `keys` or the `hook` transport;
+without the status line, cost and limits are absent and nothing else changes. To
+look at undocumented behavior, run `strings -n 8` on the resolved `claude` binary
+(a Bun single executable) and grep.
+
+The integration suite runs real Claude Code sessions on Linux (x86_64) and macOS
+(arm64). Other Unixes need the constants in `zclaude/src/sys.odin` checked; Windows
+isn't supported.
 
 ## License
 

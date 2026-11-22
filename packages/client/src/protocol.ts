@@ -29,8 +29,23 @@ export interface Meta {
    * cache reads + cache writes + output). Compare with the model's context window.
    */
   context_tokens: number;
-  /** The session's cost so far in USD, as Claude Code records it; null until it does. */
+  /** The session's cost so far in USD, live from Claude Code's status line; null until it reports. */
   cost_usd: number | null;
+  /** The context window as Claude Code reports it: its size and how much is used. */
+  context: { window_tokens?: number; used_percentage?: number; input_tokens?: number; output_tokens?: number } | null;
+  /**
+   * The plan's usage limits as Claude Code reports them, e.g.
+   * `{ five_hour: { used_percentage, resets_at }, seven_day: {…}, spend_limit?: {…} }`
+   * (`resets_at` in Unix seconds). Null for accounts without them.
+   */
+  rate_limits: Record<string, { used_percentage?: number; resets_at?: number; [key: string]: unknown }> | null;
+  thinking: boolean;
+  fast_mode: boolean;
+  /**
+   * Which of zclaude's sources are live: Claude Code's hooks, the agent inside its
+   * process, its status line, and its transcript (created with the first message).
+   */
+  sources: { hooks: boolean; agent: boolean; status_line: boolean; transcript: boolean };
 }
 
 export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
@@ -207,6 +222,10 @@ export interface Entry {
   /** A subagent's entry: the agent, and the tool call that started it. */
   agent_id?: string;
   parent_tool_use_id?: string;
+  /** User lines: Claude Code's id for the prompt they belong to (as on `turn.*` and hooks). */
+  claude_prompt_id?: string;
+  /** Assistant lines: the query that made the request, e.g. repl_main_thread or agent:builtin:Explore. */
+  query_source?: string;
   /** Replayed from before this subscriber or this process. */
   historic?: boolean;
 }
@@ -229,6 +248,8 @@ export interface TurnEnd {
   /** Main-conversation model calls in the turn. */
   messages: number;
   usage: Usage;
+  /** What the turn cost in USD, by Claude Code's own count. */
+  cost_usd?: number;
   /** StopFailure: the error kind (rate_limit, …) and details. */
   error?: string;
   error_details?: string;
@@ -251,7 +272,8 @@ export interface EventMap {
   'stream.block_stop': { stream: number; index: number; ended_at: number };
   'stream.stop_reason': { stream: number; stop_reason: string };
   'stream.end': { stream: number; status: 'done' | 'aborted'; ended_at: number };
-  'stream.confirmed': { stream: number; message_id: string };
+  /** The transcript holds this message; `main` and `query_source` settle which conversation it was. */
+  'stream.confirmed': { stream: number; message_id: string; main?: boolean; query_source?: string };
   'dialog.open': DialogInfo;
   'dialog.update': DialogUpdate;
   'term.output': { data: string; redraw?: boolean };
@@ -309,7 +331,11 @@ export type PlanResponse =
       mode?: PlanMode;
       /** An edited plan, carried out instead of Claude's. */
       plan?: string;
-      /** Feedback with the approval. Sent as the next prompt; its id is in the result. */
+      /**
+       * Feedback with the approval, given on the card as a person does (its "Tell
+       * Claude what to change" field, then Shift+Tab), so it approves into the card's
+       * first choice. The result's status is `sent`; `dialog.update` confirms.
+       */
       message?: string;
     }
   /** "Tell Claude what to change": Claude keeps planning. `interrupt` also ends the turn. */
@@ -344,8 +370,6 @@ export interface DialogResult {
   status: DialogStatus | 'sent';
   /** The mode switched to (plans, or permissions allowed with `mode`). */
   mode?: PermissionMode;
-  /** Plans approved with a message: the prompt that carries it. */
-  prompt_id?: string;
 }
 
 export type Key =
@@ -381,8 +405,12 @@ export interface Methods {
   interrupt: [undefined, { sent: boolean; via?: 'esc' | 'dialog'; state?: SessionState }];
   'dialog.respond': [{ id: string } & DialogResponse, DialogResult];
   'model.set': [{ model: string }, { model: string; status: 'switching' }];
-  /** `/effort LEVEL`. Claude Code also saves it as the default for new sessions. */
-  'effort.set': [{ level: EffortLevel }, { effort: EffortLevel; status: 'switching' }];
+  /**
+   * For this session, through the /model picker (←/→, then `s`), as a person does.
+   * `save` uses `/effort LEVEL` instead, which also makes it the default for new
+   * sessions.
+   */
+  'effort.set': [{ level: EffortLevel; save?: boolean }, { effort: EffortLevel; status: 'set' | 'switching' }];
   /** Stops a background task through /tasks, as a person would. */
   'task.stop': [{ id: string }, { task_id: string; stopped: true }];
   'mode.set': [{ mode: PermissionMode }, { mode: PermissionMode }];

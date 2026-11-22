@@ -44,6 +44,10 @@ Turn :: struct {
 	error_details: string,
 	last_message:  string,
 	duration_ms:   i64,
+	cost_start:    f64, // the session's cost when the turn began, if known
+	has_cost:      bool,
+	status_seq_at_message: int, // status reports seen when its last message finished
+	awaiting_status: bool,
 }
 
 // A finished subagent's transcript is still read this long: Claude Code writes its
@@ -77,6 +81,7 @@ turn_begin :: proc(claude_prompt := "") {
 	t.claude_prompt = strings.clone(claude_prompt)
 	t.started_at = wall_ms()
 	t.started_tick = now_ms()
+	t.cost_start, t.has_cost = h.cost_value, h.cost_seen
 	h.turn = t
 	ev := event("turn.start")
 	jw_int(&ev.w, "turn", i64(t.n))
@@ -119,12 +124,35 @@ turn_marker :: proc(duration_ms: i64) {
 	t := h.turn
 	if t == nil || !t.ending do return
 	t.duration_ms = duration_ms
-	turn_finish()
+	turn_finish_when_costed()
 }
 
 turn_timer :: proc(n: int) {
 	h := hub()
-	if h.turn != nil && h.turn.n == n && h.turn.ending do turn_finish()
+	t := h.turn
+	if t == nil || t.n != n || !t.ending do return
+	// The second expiry: the status line didn't report again; end with what's known.
+	if t.awaiting_status {
+		turn_finish()
+		return
+	}
+	turn_finish_when_costed()
+}
+
+// The status line reports the cost of a message shortly after it lands. A turn
+// ends once that report for its last message has come (a second at most), so its
+// cost is never a stale sample.
+STATUS_WAIT_MS :: 1000
+
+turn_finish_when_costed :: proc() {
+	h := hub()
+	t := h.turn
+	if h.cost_seen && h.status_seq == t.status_seq_at_message && t.messages > 0 && !t.awaiting_status {
+		t.awaiting_status = true
+		timer_add(STATUS_WAIT_MS, .Turn_End, n = t.n)
+		return
+	}
+	turn_finish()
 }
 
 turn_finish :: proc() {
@@ -145,6 +173,11 @@ turn_finish :: proc() {
 	jw_int(&ev.w, "duration_ms", t.duration_ms > 0 ? t.duration_ms : now_ms() - t.started_tick)
 	jw_int(&ev.w, "messages", i64(t.messages))
 	write_usage(&ev.w, "usage", t.usage)
+	// What the turn cost, by Claude Code's own count (its status line).
+	if h.cost_seen {
+		start := t.has_cost ? t.cost_start : 0
+		jw_raw(&ev.w, "cost_usd", fmt.tprintf("%.6f", max(h.cost_value - start, 0)))
+	}
 	if t.error != "" do jw_str(&ev.w, "error", t.error)
 	if t.error_details != "" do jw_str(&ev.w, "error_details", t.error_details)
 	if t.last_message != "" do jw_str(&ev.w, "last_message", t.last_message)
@@ -177,6 +210,7 @@ turn_add_message :: proc(s: ^Live_Stream) {
 	if h.turn == nil || h.turn.ending do turn_begin()
 	t := h.turn
 	t.messages += 1
+	t.status_seq_at_message = h.status_seq
 	t.usage.input += s.usage.input
 	t.usage.output += s.usage.output
 	t.usage.cache_read += s.usage.cache_read
@@ -653,4 +687,200 @@ drop_task :: proc(id: string) {
 	ev := event("tasks")
 	jw_raw(&ev.w, "tasks", h.tasks)
 	event_send(ev)
+}
+
+// ---------- Claude Code's own records ----------
+
+// The main conversation's queries are repl_main_thread (and its variants, such as
+// compaction); subagents' are agent:…; side calls (titles, suggestions) are others.
+is_main_query :: proc(source: string) -> bool {
+	return source == "repl_main_thread" || strings.has_prefix(source, "repl_main_thread:")
+}
+
+MAX_REQUESTS :: 512
+
+note_request :: proc(id, source: string) {
+	h := hub()
+	if id == "" || source == "" || id in h.requests do return
+	key := strings.clone(id)
+	h.requests[key] = strings.clone(source)
+	append(&h.request_order, key)
+	if len(h.request_order) > MAX_REQUESTS {
+		old := h.request_order[0]
+		ordered_remove(&h.request_order, 0)
+		delete(h.requests[old])
+		delete_key(&h.requests, old)
+		delete(old)
+	}
+}
+
+// UserPromptSubmit names the prompt Claude Code took and its prompt_id: a prompt
+// zclaude typed with that text is that one, and its entries carry the id.
+bind_prompt :: proc(text, claude_id: string) {
+	h := hub()
+	if claude_id == "" do return
+	for p in h.in_flight {
+		if p.claude_id == "" && prompt_matches(p.text, text) {
+			p.claude_id = strings.clone(claude_id)
+			return
+		}
+	}
+}
+
+// ---------- The status line ----------
+
+// Claude Code's status line input: its own live account of cost, the context
+// window, rate limits, effort and model.
+hub_on_status :: proc(v: Value) {
+	h := hub()
+	h.status_seq += 1
+	defer if t := h.turn; t != nil && t.awaiting_status do turn_finish()
+	// The fields every hook carries: the session, its transcript, the permission mode.
+	hook_common(v)
+	#partial switch cost in jget(v, "cost", "total_cost_usd") {
+	case json.Float:
+		h.cost_value, h.cost_seen = f64(cost), true
+	case json.Integer:
+		h.cost_value, h.cost_seen = f64(cost), true
+	}
+	if h.cost_seen do set_meta_raw("cost_usd", &h.cost_usd, fmt.tprintf("%.6f", h.cost_value))
+	if cw, ok := jget(v, "context_window").(Object); ok {
+		b := strings.builder_make(context.temp_allocator)
+		w := jw_make(&b)
+		jw_obj(&w)
+		number :: proc(w: ^Jw, key: string, value: Value) {
+			#partial switch x in value {
+			case json.Integer, json.Float: jw_value(w, key, x)
+			}
+		}
+		number(&w, "window_tokens", cw["context_window_size"])
+		number(&w, "used_percentage", cw["used_percentage"])
+		number(&w, "input_tokens", cw["total_input_tokens"])
+		number(&w, "output_tokens", cw["total_output_tokens"])
+		jw_end_obj(&w)
+		set_meta_raw("context", &h.context_info, strings.to_string(b))
+	}
+	if limits := jget(v, "rate_limits"); limits != nil do set_meta_raw("rate_limits", &h.rate_limits, to_json(limits, context.temp_allocator))
+	if effort := jstr(v, "effort", "level"); effort != "" do set_meta("effort", &h.effort, effort)
+	if model := jstr(v, "model", "id"); model != "" && h.model_pending == "" do set_meta("model", &h.model, model)
+	if thinking, ok := jget(v, "thinking", "enabled").(json.Boolean); ok do set_meta_bool("thinking", &h.thinking, bool(thinking))
+	if fast, ok := jget(v, "fast_mode").(json.Boolean); ok do set_meta_bool("fast_mode", &h.fast_mode, bool(fast))
+}
+
+// ---------- Effort for this session ----------
+
+// `/effort LEVEL` also saves the level as the default for new sessions. The /model
+// picker can change it for this session alone: ←/→ moves the effort, `s` applies
+// it "for this session only" to the model already chosen. zclaude drives the picker
+// that way, reading the screen before each key.
+Effort_Task :: struct {
+	client_id: int,
+	req_id:    string,
+	target:    string,
+	steps:     int,
+	pressed:   bool,
+}
+
+EFFORT_ORDER :: []string{"low", "medium", "high", "xhigh", "max"}
+EFFORT_STEP_MS :: 150
+EFFORT_STEPS :: 40
+
+hub_set_effort_session :: proc(cl: ^Client, req_id, level: string) -> string {
+	h := hub()
+	if !h.session_started do return "the session has not started yet"
+	if h.state != "idle" do return "cannot change effort while Claude is busy"
+	if h.effort_task != nil || h.task_stop != nil || h.mode_task != nil do return "another change is already running"
+	if len(h.dialogs) > 0 || card_on_screen(app.screen) || settling() do return "a dialog is open; answer it first"
+	if h.effort == level {
+		reply_result(cl, req_id, fmt.tprintf(`{{"effort":"%s","status":"set"}}`, level))
+		return ""
+	}
+	t := new(Effort_Task)
+	t.client_id = cl.id
+	t.req_id = strings.clone(req_id)
+	t.target = strings.clone(level)
+	h.effort_task = t
+	route := input_route()
+	send_input(route, transmute([]u8)string("\x15\x1b[200~/model\x1b[201~"))
+	timer_add(KEY_DELAY_MS, .Input, "\r", route)
+	timer_add(KEY_DELAY_MS + 300, .Effort_Step)
+	return ""
+}
+
+effort_step :: proc() {
+	h := hub()
+	t := h.effort_task
+	if t == nil do return
+	finish :: proc(err: string) {
+		h := hub()
+		t := h.effort_task
+		if cl := client_by_id(t.client_id); cl != nil {
+			if err != "" do reply_error(cl, t.req_id, err)
+			else do reply_result(cl, t.req_id, fmt.tprintf(`{{"effort":"%s","status":"set"}}`, t.target))
+		}
+		if err == "" do set_meta("effort", &h.effort, t.target)
+		delete(t.req_id)
+		delete(t.target)
+		free(t)
+		h.effort_task = nil
+	}
+	t.steps += 1
+	level, open := effort_on_screen(app.screen)
+	if t.pressed {
+		if !open {
+			finish("")
+			return
+		}
+	} else if t.steps >= EFFORT_STEPS {
+		if open do pty_write(transmute([]u8)string("\x1b"))
+		finish(open ? fmt.tprintf("could not reach %s effort in the model picker", t.target) : "the model picker has no effort setting for this model")
+		return
+	}
+	if t.steps >= EFFORT_STEPS * 2 {
+		finish("the model picker did not close")
+		return
+	}
+	defer timer_add(EFFORT_STEP_MS, .Effort_Step)
+	if !open || t.pressed do return
+	// The choice stays the model in use (marked ✔), so only the effort changes.
+	menu := screen_menu(app.screen)
+	current := -1
+	for label, i in menu.labels do if strings.contains(label, "✔") do current = i
+	if current >= 0 && menu.cursor >= 0 && menu.cursor != current {
+		key, _ := key_bytes(menu.cursor < current ? "down" : "up")
+		pty_write(transmute([]u8)key)
+		return
+	}
+	if level == t.target {
+		pty_write(transmute([]u8)string("s"))
+		t.pressed = true
+		return
+	}
+	have, want := -1, -1
+	for l, i in EFFORT_ORDER {
+		if l == level do have = i
+		if l == t.target do want = i
+	}
+	key, _ := key_bytes(have >= 0 && have > want ? "left" : "right")
+	pty_write(transmute([]u8)key)
+}
+
+// The picker's effort row, as in "◐ Medium effort (default) ←/→ to adjust".
+effort_on_screen :: proc(s: ^Screen) -> (level: string, open: bool) {
+	for raw in screen_lines(s) {
+		line := strings.to_lower(raw, context.temp_allocator)
+		if !strings.contains(line, "to adjust") do continue
+		at := strings.index(line, " effort")
+		if at < 0 do continue
+		before := strings.trim_space(line[:at])
+		switch {
+		case strings.has_suffix(before, "extra high"), strings.has_suffix(before, "xhigh"), strings.has_suffix(before, "x-high"): return "xhigh", true
+		case strings.has_suffix(before, "max"): return "max", true
+		case strings.has_suffix(before, "high"): return "high", true
+		case strings.has_suffix(before, "medium"): return "medium", true
+		case strings.has_suffix(before, "low"): return "low", true
+		}
+		return "", true
+	}
+	return "", false
 }

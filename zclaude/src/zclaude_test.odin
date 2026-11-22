@@ -500,7 +500,7 @@ plan_approval_sets_the_mode_and_interrupt_refuses_held_dialogs :: proc(t: ^testi
 	bypass, _ := parse_json(`{"id":"p1","decision":"approve","mode":"bypassPermissions"}`)
 	_, berr := rpc_dialog_respond(bypass)
 	testing.expect(t, berr != "")
-	approve, _ := parse_json(`{"id":"p1","decision":"approve","mode":"acceptEdits","plan":"y","message":"also add tests"}`)
+	approve, _ := parse_json(`{"id":"p1","decision":"approve","mode":"acceptEdits","plan":"y"}`)
 	res, err := rpc_dialog_respond(approve)
 	testing.expect_value(t, err, "")
 	output, _ := parse_json(jstr(drain(hook)[0], "result", "output"))
@@ -510,11 +510,8 @@ plan_approval_sets_the_mode_and_interrupt_refuses_held_dialogs :: proc(t: ^testi
 	// ExitPlanMode needs a person, so Claude Code only takes an allow that carries the
 	// input. An edited plan goes back the same way.
 	testing.expect_value(t, jstr(output, "hookSpecificOutput", "decision", "updatedInput", "plan"), "y")
-	// Feedback follows as a prompt, once the card has gone.
 	reply, _ := parse_json(res)
 	testing.expect_value(t, jstr(reply, "mode"), "acceptEdits")
-	testing.expect(t, jstr(reply, "prompt_id") != "")
-	testing.expect_value(t, hub().inproc_queue[0].text, "also add tests")
 
 	hook2 := capture(subscribed = false)
 	hook_event(`{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"b2","tool_input":{"command":"rm x"}}`)
@@ -1080,4 +1077,102 @@ the_tasks_view_is_read_for_stopping_a_task :: proc(t: ^testing.T) {
 	testing.expect_value(t, d.target, 0)
 	screen_feed(app.screen, transmute([]u8)string("\x1b[2J\x1b[22;1H❯ \x1b[24;1H  ? for shortcuts"))
 	testing.expect(t, !tasks_view(app.screen, labels).open)
+}
+
+@(test)
+the_status_line_gives_cost_context_limits_and_exact_turn_cost :: proc(t: ^testing.T) {
+	reset_app()
+	cap := capture()
+	hook_event(`{"hook_event_name":"SessionStart"}`)
+	status :: proc(cost: string) {
+		v, _ := parse_json(fmt.tprintf(`{{"permission_mode":"acceptEdits","cost":{{"total_cost_usd":%s}},"context_window":{{"context_window_size":200000,"used_percentage":12,"total_input_tokens":24000,"total_output_tokens":10}},"rate_limits":{{"five_hour":{{"used_percentage":30,"resets_at":1795}}}},"effort":{{"level":"high"}},"model":{{"id":"claude-haiku-5-5"}},"thinking":{{"enabled":true}}}}`, cost))
+		hub_on_status(v)
+	}
+	status("0.5")
+	testing.expect_value(t, hub().cost_usd, "0.500000")
+	testing.expect_value(t, hub().permission_mode, "acceptEdits")
+	testing.expect_value(t, hub().effort, "high")
+	testing.expect(t, strings.contains(hub().context_info, `"window_tokens":200000`))
+	testing.expect(t, strings.contains(hub().rate_limits, `"five_hour"`))
+	// A turn's cost is the difference, taken after the status line has reported on
+	// its last message.
+	hook_event(`{"hook_event_name":"UserPromptSubmit","prompt_id":"c1"}`)
+	stream_event(`{"stream":1,"type":"message_start","message_id":"m1","in_thread":true}`)
+	stream_event(`{"stream":1,"type":"message_stop"}`)
+	hook_event(`{"hook_event_name":"Stop"}`)
+	turn_marker(10)
+	testing.expect(t, hub().turn != nil && hub().turn.awaiting_status)
+	status("0.75")
+	end := events_of(drain(cap), "turn.end")[0]
+	testing.expect_value(t, to_json(jget(end, "cost_usd"), context.temp_allocator), "0.25")
+}
+
+@(test)
+prompts_and_requests_are_linked_by_claude_codes_own_ids :: proc(t: ^testing.T) {
+	reset_app()
+	cap := capture()
+	path := temp_transcript("ids")
+	hook_event(fmt.tprintf(`{{"hook_event_name":"SessionStart","transcript_path":"%s"}}`, path))
+	p, _ := hub_send_prompt("hello there", "inproc")
+	hook_event(`{"hook_event_name":"UserPromptSubmit","prompt":"hello there","prompt_id":"cp9"}`)
+	testing.expect_value(t, p.claude_id, "cp9")
+	stream_event(`{"stream":1,"type":"message_start","message_id":"m1","in_thread":false}`)
+	// The user line is matched by id, whatever its text became.
+	append_file(path, `{"type":"user","uuid":"u1","promptId":"cp9","message":{"content":"[Pasted text #1]"}}` + "\n")
+	append_file(path, `{"type":"api-request","id":"r1","querySource":"repl_main_thread"}` + "\n")
+	append_file(path, `{"type":"assistant","uuid":"u2","requestRef":"r1","message":{"id":"m1","content":[{"type":"text","text":"hi"}]}}` + "\n")
+	hub_poll_transcript()
+	msgs := drain(cap)
+	entries := events_of(msgs, "entry")
+	testing.expect_value(t, jstr(entries[0], "prompt_id"), p.id)
+	testing.expect_value(t, jstr(entries[0], "claude_prompt_id"), "cp9")
+	testing.expect_value(t, jstr(entries[1], "query_source"), "repl_main_thread")
+	confirmed := events_of(msgs, "stream.confirmed")[0]
+	testing.expect(t, jbool(confirmed, "main"))
+	testing.expect(t, is_main_query("repl_main_thread:compact") && !is_main_query("agent:builtin:Explore"))
+}
+
+@(test)
+the_status_line_setting_wraps_the_persons_own :: proc(t: ^testing.T) {
+	s, err := build_settings("/z", "/s.sock", `{"statusLine":{"type":"command","command":"echo mine","padding":2}}`)
+	testing.expect_value(t, err, "")
+	v, _ := parse_json(s)
+	line := jget(v, "statusLine")
+	testing.expect(t, strings.has_prefix(jstr(line, "command"), "'/z' __hook status '/s.sock' "))
+	padding, _ := jint(line, "padding")
+	testing.expect_value(t, padding, 2)
+}
+
+@(test)
+plan_feedback_goes_through_the_cards_own_field :: proc(t: ^testing.T) {
+	reset_app()
+	hook := capture(subscribed = false)
+	hook_event(`{"hook_event_name":"PreToolUse","tool_name":"ExitPlanMode","tool_use_id":"p1","tool_input":{"plan":"x"}}`)
+	req, _ := parse_json(`{"hook_event_name":"PermissionRequest","tool_name":"ExitPlanMode","tool_input":{"plan":"x"}}`)
+	hub_on_permission_request(hook.cl, "1", req)
+	screen_feed(app.screen, transmute([]u8)string("Would you like to proceed?\r\n \u276f 1. Yes, and use auto mode\r\n   2. Yes, manually approve edits\r\n   3. Tell Claude what to change\r\n      shift+tab to approve with this feedback\r\n   ctrl+g to edit in Vim\r\n"))
+	hub().screen_dirty = true
+	hub_after_tick()
+	// The card's own Shift+Tab hint is not the prompt box's footer.
+	testing.expect(t, card_on_screen(app.screen))
+	// Shift+Tab approves feedback into the card's first choice; another can't have it.
+	wrong, _ := parse_json(`{"id":"p1","decision":"approve","mode":"default","message":"use fine"}`)
+	_, werr := rpc_dialog_respond(wrong)
+	testing.expect(t, strings.contains(werr, "first choice, auto"))
+	right, _ := parse_json(`{"id":"p1","decision":"approve","message":"use fine"}`)
+	res, err := rpc_dialog_respond(right)
+	testing.expect_value(t, err, "")
+	testing.expect(t, strings.contains(res, `"sent"`) && strings.contains(res, `"auto"`))
+	keys := make([dynamic]string, context.temp_allocator)
+	for tm in app.timers do if tm.kind == .Input do append(&keys, tm.data)
+	testing.expect_value(t, keys[len(keys) - 1], "\x1b[Z")
+	testing.expect(t, strings.contains(keys[len(keys) - 2], "use fine"))
+	// The hook isn't answered: Claude Code takes the card's answer.
+	testing.expect_value(t, len(drain(hook)), 0)
+	testing.expect(t, hub().dialogs[0].rpc_keys)
+	cap := capture()
+	hook_event(`{"hook_event_name":"PostToolUse","tool_name":"ExitPlanMode","tool_use_id":"p1"}`)
+	closed := events_of(drain(cap), "dialog.update")[0]
+	testing.expect_value(t, jstr(closed, "status"), "approved")
+	testing.expect_value(t, jstr(closed, "resolved_by"), "rpc")
 }

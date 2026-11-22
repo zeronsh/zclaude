@@ -241,7 +241,7 @@ export class SessionStore {
         this.#setStream(p.stream, (s) => this.#pruned({ ...s, status: p.status, ended_at: p.ended_at }));
         break;
       case 'stream.confirmed':
-        this.#setStream(p.stream, (s) => this.#pruned({ ...s, in_transcript: true }));
+        this.#setStream(p.stream, (s) => this.#pruned({ ...s, in_transcript: true, ...(p.main !== undefined && { main: p.main }) }));
         break;
       case 'dialog.open': {
         const { seq: _, ...dialog } = p as DialogInfo & { seq: number };
