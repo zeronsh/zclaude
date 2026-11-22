@@ -3,13 +3,15 @@
 //   bun server.ts [--port 7777] [--bin PATH] [--cwd DIR] [-- claude args...]
 //
 // This is a consumer of zclaude, nothing more. zclaude stores nothing, so the
-// storage here is this server's own choice: an in-memory log of every event except
-// terminal output, replayed to each browser that connects so a reload rebuilds the
-// whole conversation. The terminal is redrawn from zclaude's screen instead.
+// storage here is this server's own choice: the session folded into one in-memory
+// SessionStore (the reducer from @zclaude/client), bounded to the last MAX_ENTRIES
+// conversation entries, with token text dropped once the transcript holds it. Each
+// browser that connects gets that state, then live events. The terminal is redrawn
+// from zclaude's screen instead.
 //
 // It hands out a shell-equivalent terminal, so it binds to loopback and every route
 // needs the random token in the printed URL (or the cookie set from it).
-import { ZClaude, type ZEvent } from '@zclaude/client';
+import { SessionStore, ZClaude } from '@zclaude/client';
 import type { ServerWebSocket } from 'bun';
 import { existsSync, statSync } from 'node:fs';
 import { dirname, join, normalize, resolve } from 'node:path';
@@ -70,9 +72,9 @@ const TERMINAL_REPLY = /^\x1b\[(\?[\d;]*c|>[\d;]*c|\d+;\d+R|I|O|\?[\d;]*\$y|>[\d
 type Socket = ServerWebSocket<{ term: boolean }>;
 const sockets = new Set<Socket>();
 let session: ZClaude | null = null;
-/** Every event but terminal output since the session started. */
-let log: ZEvent[] = [];
-let exitCode: number | null = null;
+/** Enough for a long session; older entries are dropped from the replay, not from Claude. */
+const MAX_ENTRIES = 5000;
+let state = new SessionStore({ maxEntries: MAX_ENTRIES });
 
 function broadcast(message: unknown, onlyTerm = false): void {
   const text = JSON.stringify(message);
@@ -83,8 +85,7 @@ function broadcast(message: unknown, onlyTerm = false): void {
 }
 
 function start(): void {
-  log = [];
-  exitCode = null;
+  state = new SessionStore({ maxEntries: MAX_ENTRIES });
   const z = ZClaude.spawn({ bin, cwd, args: claudeArgs });
   session = z;
   z.onEvent((event) => {
@@ -92,7 +93,7 @@ function start(): void {
       broadcast({ type: 'term', data: event.params.data }, true);
       return;
     }
-    log.push(event);
+    state.apply(event);
     broadcast({ type: 'event', event });
   });
   z.ready
@@ -100,7 +101,9 @@ function start(): void {
     .catch((error) => console.error('zclaude did not start:', error.message));
   z.exited.then((code) => {
     if (session !== z) return;
-    exitCode = code;
+    // zclaude's own `exit` event (already in the store) carries the code and any
+    // signal; this covers a zclaude that died before sending one.
+    if (state.view.state !== 'exited') state.apply({ method: 'exit', params: { seq: state.view.seq, code: code ?? -1 } });
     console.log(`zclaude exited with code ${code}`);
     broadcast({ type: 'exited', code });
     broadcast({ type: 'term', data: Buffer.from(`\r\n[zclaude exited with code ${code}]\r\n`).toString('base64') }, true);
@@ -166,7 +169,7 @@ const server = Bun.serve<{ term: boolean }>({
     maxPayloadLength: 64 * 1024 * 1024,
     open(socket) {
       sockets.add(socket);
-      socket.send(JSON.stringify({ type: 'replay', events: log, exited: exitCode }));
+      socket.send(JSON.stringify({ type: 'replay', view: state.view }));
       // The terminal starts from the current screen, then follows live output.
       const z = session;
       if (!z || z.closed) {

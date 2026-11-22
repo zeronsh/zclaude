@@ -32,8 +32,8 @@ foreign libc {
 	@(link_name = "setsid")     c_setsid     :: proc() -> c.int ---
 	@(link_name = "setpgid")    c_setpgid    :: proc(pid, pgid: c.int) -> c.int ---
 	@(link_name = "tcsetpgrp")  c_tcsetpgrp  :: proc(fd: c.int, pgrp: c.int) -> c.int ---
+	@(link_name = "tcgetpgrp")  c_tcgetpgrp  :: proc(fd: c.int) -> c.int ---
 	@(link_name = "signal")     c_signal     :: proc(sig: c.int, handler: rawptr) -> rawptr ---
-	@(link_name = "poll")       c_poll       :: proc(fds: [^]Poll_Fd, n: c.uint, timeout: c.int) -> c.int ---
 	@(link_name = "socket")     c_socket     :: proc(domain, kind, protocol: c.int) -> c.int ---
 	@(link_name = "bind")       c_bind       :: proc(fd: c.int, addr: rawptr, len: u32) -> c.int ---
 	@(link_name = "listen")     c_listen     :: proc(fd: c.int, backlog: c.int) -> c.int ---
@@ -48,7 +48,7 @@ foreign libc {
 	@(link_name = "ptsname")    c_ptsname    :: proc(fd: c.int) -> cstring ---
 	@(link_name = "cfmakeraw")  c_cfmakeraw  :: proc(t: ^posix.termios) ---
 	@(link_name = "realpath")   c_realpath   :: proc(path: cstring, resolved: [^]u8) -> cstring ---
-	@(link_name = "lseek")      c_lseek      :: proc(fd: c.int, off: i64, whence: c.int) -> i64 ---
+	@(link_name = "pread")      c_pread      :: proc(fd: c.int, buf: rawptr, n: c.size_t, off: i64) -> c.ssize_t ---
 }
 
 // open(2) and chmod(2) are declared by core:sys/posix with typed flags, and a
@@ -61,11 +61,20 @@ c_chmod :: proc(path: cstring, mode: c.int) -> c.int {
 	return posix.chmod(path, transmute(posix.mode_t)posix._mode_t(mode)) == .OK ? 0 : -1
 }
 
+// poll(2) is declared by core:sys/posix too (with an nfds_t that differs per OS).
+c_poll :: #force_inline proc(fds: [^]Poll_Fd, n: c.uint, timeout: c.int) -> c.int {
+	return posix.poll(cast([^]posix.pollfd)fds, posix.nfds_t(n), timeout)
+}
+
+#assert(size_of(Poll_Fd) == size_of(posix.pollfd))
+
 Poll_Fd :: struct {
 	fd:      c.int,
 	events:  c.short,
 	revents: c.short,
 }
+
+O_RDONLY :: 0
 
 POLLIN   :: 0x1
 POLLOUT  :: 0x4
@@ -97,6 +106,7 @@ SIG_IGN :: rawptr(uintptr(1))
 EINTR :: 4
 
 when ODIN_OS == .Darwin {
+	O_CLOEXEC  :: 0x1000000
 	O_RDWR     :: 0x2
 	O_NONBLOCK :: 0x4
 	O_NOCTTY   :: 0x20000
@@ -117,6 +127,7 @@ when ODIN_OS == .Darwin {
 		sun_path:   [104]u8,
 	}
 } else {
+	O_CLOEXEC  :: 0o2000000
 	O_RDWR     :: 0x2
 	O_NONBLOCK :: 0o4000
 	O_NOCTTY   :: 0o400

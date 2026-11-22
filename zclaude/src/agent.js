@@ -364,7 +364,8 @@
       if (!stream) stream = ++nextStream;
       if (event.type === 'message_stop') stopped = true;
       const delta = event.delta ?? {};
-      const usage = event.type === 'message_start' ? event.message?.usage : undefined;
+      // message_start carries the input side; message_delta the running output count.
+      const usage = event.type === 'message_start' ? event.message?.usage : event.type === 'message_delta' ? event.usage : undefined;
       send('agent.stream', {
         stream,
         type: event.type,
@@ -376,6 +377,8 @@
         code_mode: event.type === 'message_start' ? link?.codeMode : undefined,
         cache_read_tokens: usage?.cache_read_input_tokens,
         cache_write_tokens: usage?.cache_creation_input_tokens,
+        input_tokens: usage?.input_tokens,
+        output_tokens: usage?.output_tokens,
         index: event.index,
         block_type: event.content_block?.type,
         tool: event.content_block?.name,

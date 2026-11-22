@@ -1,11 +1,20 @@
 {
   "name": "zclaude-monorepo",
   "private": true,
-  "workspaces": ["packages/*", "playground"],
+  "license": "MIT",
+  "workspaces": [
+    "packages/*",
+    "playground"
+  ],
   "scripts": {
     "build": "make -C zclaude",
     "test": "make -C zclaude test",
     "test:integration": "bun test --timeout 240000 zclaude/tests",
-    "playground": "bun run --cwd playground start"
+    "playground": "bun run --cwd playground start",
+    "typecheck": "tsc -p . && bun run --cwd playground typecheck"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9"
   }
 }

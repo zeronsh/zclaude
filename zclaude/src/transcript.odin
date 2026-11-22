@@ -104,6 +104,18 @@ parse_model_switch_output :: proc(text: string) -> (model: string, ok: bool) {
 	return "", false
 }
 
+// The level from `/effort`'s output, such as "Set effort level to high (saved as
+// your default for new sessions)".
+parse_effort_output :: proc(text: string) -> (level: string, ok: bool) {
+	stdout := parse_command_stdout(text) or_return
+	PREFIX :: "Set effort level to "
+	if !strings.has_prefix(stdout, PREFIX) do return "", false
+	rest := stdout[len(PREFIX):]
+	end := 0
+	for end < len(rest) && rest[end] >= 'a' && rest[end] <= 'z' do end += 1
+	return rest[:end], end > 0
+}
+
 @(private = "file")
 extract_model_token :: proc(rest_in: string) -> (string, bool) {
 	rest := strings.trim_left_space(rest_in)
@@ -325,6 +337,11 @@ parse_system :: proc(v: Value) -> (Parsed, bool) {
 	case "compact_boundary", "api_error":
 		text := jstr(v, "content")
 		return Parsed{role = "system", origin = "system", text = text, blocks = text_block(text)}, true
+	case "local_command":
+		// Newer builds record slash commands and their output this way.
+		text := jstr(v, "content")
+		if text == "" do return {}, false
+		return Parsed{role = "user", origin = "command", text = text, blocks = text_block(text)}, true
 	}
 	return {}, false
 }

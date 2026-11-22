@@ -332,25 +332,41 @@ function ModeSelect({ value }: { value: SessionView }): ReactNode {
   );
 }
 
-function StateBadge({ state }: { state: string }): ReactNode {
-  const [busyFor, setBusyFor] = useState('');
-  useEffect(() => {
-    if (state !== 'busy') {
-      setBusyFor('');
-      return;
+// What the busy badge says, from zclaude's `activity`.
+function activityLabel(activity: SessionView['activity'], now: number): string {
+  switch (activity.activity) {
+    case 'requesting': return 'Waiting for the model';
+    case 'thinking': return 'Thinking';
+    case 'responding': return 'Writing';
+    case 'calling': return activity.tool ? `Calling ${activity.tool}` : 'Calling a tool';
+    case 'tool': return activity.tool ? `Running ${activity.tool}` : 'Running a tool';
+    case 'compacting': return 'Compacting';
+    case 'retrying': {
+      const left = activity.retry_at ? Math.max(0, Math.ceil((activity.retry_at - now) / 1000)) : 0;
+      return left ? `Retrying in ${left}s` : 'Retrying';
     }
-    const started = Date.now();
-    const timer = setInterval(() => {
-      const elapsed = Date.now() - started;
-      setBusyFor(elapsed > 1000 ? formatDuration(elapsed).replace(/\.\ds$/, 's') : '');
-    }, 250);
+    default: return '';
+  }
+}
+
+function StateBadge({ value }: { value: SessionView }): ReactNode {
+  const { state, activity, turn } = value;
+  const [now, setNow] = useState(Date.now());
+  const ticking = state === 'busy' || activity.activity === 'retrying';
+  useEffect(() => {
+    if (!ticking) return;
+    const timer = setInterval(() => setNow(Date.now()), 250);
     return () => clearInterval(timer);
-  }, [state]);
+  }, [ticking]);
+  // Timed from the turn's own start, so a reload keeps the count.
+  const elapsed = state === 'busy' && turn ? now - turn.started_at : 0;
+  const busyFor = elapsed > 1000 ? formatDuration(elapsed).replace(/\.\ds$/, 's') : '';
+  const label = (state === 'busy' && activityLabel(activity, now)) || STATES[state] || state;
   const tone = state === 'awaiting_input' ? 'bg-warning' : state === 'busy' ? 'bg-foreground animate-pulse' : state === 'idle' ? 'bg-success' : 'bg-muted-foreground';
   return (
     <Badge variant="outline" role="status" className="gap-1.5">
       <span className={cn('size-1.5 rounded-full', tone)} />
-      {STATES[state] ?? state}
+      {label}
       {busyFor ? <span className="text-muted-foreground tabular-nums">{busyFor}</span> : null}
     </Badge>
   );
@@ -394,7 +410,7 @@ function Header({ value }: { value: SessionView }): ReactNode {
           Restart
         </Button>
       ) : null}
-      <StateBadge state={value.state} />
+      <StateBadge value={value} />
     </header>
   );
 }
