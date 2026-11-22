@@ -364,8 +364,9 @@ describe('headless session', () => {
     const mark = s.log.mark();
     await s.z.send('Use the Agent tool with subagent_type general-purpose and this task: "Reply with exactly: sub-ok". Wait for its result, then reply with exactly what it returned.');
     const call = await s.log.wait('hook', (p) => p.name === 'PreToolUse' && p.tool === 'Agent', mark);
-    const started = await s.log.wait('agent.start', (p) => !p.internal, mark);
-    expect(started.parent_tool_use_id).toBe(call.tool_use_id);
+    // Other agents may run beside it (a person's plugins start their own); this is
+    // the one its tool call started.
+    const started = await s.log.wait('agent.start', (p) => p.parent_tool_use_id === call.tool_use_id, mark);
     expect(started.agent_type).toBe('general-purpose');
     const stopped = await s.log.wait('agent.stop', (p) => p.agent_id === started.agent_id, mark);
     expect(stopped.last_message).toContain('sub-ok');

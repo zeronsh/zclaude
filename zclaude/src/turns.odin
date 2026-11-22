@@ -556,6 +556,7 @@ hub_stop_task :: proc(cl: ^Client, req_id, id: string) -> string {
 	if !can_type_prompt() && h.state != "busy" do return "the terminal is showing a dialog; answer it first"
 	if len(h.dialogs) > 0 || card_on_screen(app.screen) || settling() do return "the terminal is showing a dialog; answer it first"
 	if composer_draft(app.screen) do return "the prompt box has a draft in it"
+	if !prompt_box_visible() do return "the terminal is showing a view; close it first (Esc)"
 	ts := new(Task_Stop)
 	ts.client_id = cl.id
 	ts.req_id = strings.clone(req_id)
@@ -602,7 +603,7 @@ task_stop_step :: proc() {
 		return
 	}
 	if ts.steps >= TASK_STOP_STEPS {
-		if view.open do pty_write(transmute([]u8)string("\x1b"))
+		if !prompt_box_visible() do pty_write(transmute([]u8)string("\x1b"))
 		finish("could not find the task in /tasks")
 		return
 	}
@@ -675,7 +676,10 @@ tasks_view :: proc(s: ^Screen, labels: []string) -> (v: Tasks_View) {
 		t := strings.trim_space(l)
 		marked := strings.has_prefix(t, "❯")
 		t = strings.trim_left_space(strings.trim_prefix(t, "❯"))
-		if !strings.has_prefix(t, "●") && !strings.has_prefix(t, "○") && !strings.has_prefix(t, "◯") do continue
+		// A row starts with its status bullet, which differs by platform (● on Linux,
+		// ⏺ on macOS); headings start with a word or a number.
+		first, _ := utf8.decode_rune_in_string(t)
+		if first < 0x2000 || (first >= 0x2500 && first <= 0x259F) do continue
 		if marked do v.cursor = row
 		if v.target < 0 && matches(t, labels) do v.target = row
 		row += 1
@@ -803,6 +807,7 @@ hub_set_effort_session :: proc(cl: ^Client, req_id, level: string) -> string {
 	if h.effort_task != nil || h.task_stop != nil || h.mode_task != nil do return "another change is already running"
 	if len(h.dialogs) > 0 || card_on_screen(app.screen) || settling() do return "a dialog is open; answer it first"
 	if composer_draft(app.screen) do return "the prompt box has a draft in it"
+	if !prompt_box_visible() do return "the terminal is showing a view; close it first (Esc)"
 	if h.effort == level {
 		reply_result(cl, req_id, fmt.tprintf(`{{"effort":"%s","status":"set"}}`, level))
 		return ""
@@ -844,7 +849,7 @@ effort_step :: proc() {
 			return
 		}
 	} else if t.steps >= EFFORT_STEPS {
-		if open do pty_write(transmute([]u8)string("\x1b"))
+		if !prompt_box_visible() do pty_write(transmute([]u8)string("\x1b"))
 		finish(open ? fmt.tprintf("could not reach %s effort in the model picker", t.target) : "the model picker has no effort setting for this model")
 		return
 	}
@@ -948,4 +953,11 @@ composer_draft :: proc(s: ^Screen) -> bool {
 		}
 	}
 	return false
+}
+
+// The prompt box is up (its footer, with the mode indicator, shows): no view or card
+// covers it, so what is typed goes into it.
+prompt_box_visible :: proc() -> bool {
+	_, ok := detect_mode(app.screen)
+	return ok
 }

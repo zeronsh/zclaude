@@ -2007,6 +2007,14 @@ shutdown_step :: proc() {
 		// Claude Code takes a moment to wind a turn down after Esc.
 		if now - sd.esc_at < 400 do return
 	}
+	// A view over the prompt box (/tasks, a picker) would swallow /exit: Esc first.
+	if !prompt_box_visible() {
+		if now - sd.esc_at > 500 {
+			send_input(input_route(), transmute([]u8)string("\x1b"))
+			sd.esc_at = now
+		}
+		return
+	}
 	// Typed once, and again if the first was swallowed (by a menu, say).
 	if sd.exits == 0 || (sd.exits == 1 && now - sd.exit_at > 2500) {
 		route := input_route()

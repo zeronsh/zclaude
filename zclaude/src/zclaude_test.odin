@@ -626,6 +626,11 @@ shutdown_ends_the_turn_then_types_exit_then_hangs_up :: proc(t: ^testing.T) {
 	testing.expect_value(t, app.shutdown.exits, 0)
 	app.shutdown.esc_at -= 1000
 	hook_event(`{"hook_event_name":"Stop"}`)
+	// /exit goes only into a visible prompt box.
+	shutdown_step()
+	testing.expect_value(t, app.shutdown.exits, 0)
+	screen_feed(app.screen, transmute([]u8)string("\x1b[24;1H  ? for shortcuts"))
+	app.shutdown.esc_at -= 1000
 	shutdown_step()
 	testing.expect_value(t, app.shutdown.exits, 1)
 	// Prompts are refused rather than typed into a closing session.
@@ -1072,6 +1077,12 @@ the_tasks_view_is_read_for_stopping_a_task :: proc(t: ^testing.T) {
 	testing.expect_value(t, v.cursor, 0)
 	testing.expect_value(t, v.target, 1)
 	screen_feed(app.screen, transmute([]u8)string("\x1b[2J\x1b[12;1H▔▔▔▔▔▔▔▔▔▔▔▔\r\n  Sleep 301 seconds in background\r\n  Command:  sleep 301\r\n  ← to go back · x to stop · Enter/Space to close · Esc to close\r\n"))
+	// macOS draws the bullets as ⏺.
+	screen_feed(app.screen, transmute([]u8)string("\x1b[2J\x1b[12;1H\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\r\n  Background\r\n  \u276f \u23fa sleep 302   running\r\n    \u23fa sleep 301   running\r\n  \u2191/\u2193 to navigate \u00b7 x to stop \u00b7 Esc to close\r\n"))
+	m := tasks_view(app.screen, labels)
+	testing.expect_value(t, m.cursor, 0)
+	testing.expect_value(t, m.target, 1)
+	screen_feed(app.screen, transmute([]u8)string("\x1b[2J\x1b[12;1H\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\r\n  Sleep 301 seconds in background\r\n  Command:  sleep 301\r\n  \u2190 to go back \u00b7 x to stop \u00b7 Enter/Space to close \u00b7 Esc to close\r\n"))
 	d := tasks_view(app.screen, labels)
 	testing.expect(t, d.open && d.detail)
 	testing.expect_value(t, d.target, 0)
