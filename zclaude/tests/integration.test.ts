@@ -187,6 +187,13 @@ describe('headless session', () => {
     expect(activities.at(-1)).toBe('idle');
     expect(s.store.view.meta.context_tokens).toBeGreaterThan(0);
     expect(s.store.view.lastTurn?.turn).toBe(end.turn);
+    // Claude Code's own ids link the prompt and the request exactly.
+    expect(user.claude_prompt_id).toBe(end.claude_prompt_id);
+    expect(entry.query_source).toBe('repl_main_thread');
+    // Its own accounting, from the status line: the turn's cost and the context window.
+    expect(end.cost_usd).toBeGreaterThan(0);
+    expect(s.store.view.meta.cost_usd).toBeGreaterThanOrEqual(end.cost_usd!);
+    expect(s.store.view.meta.context?.window_tokens).toBeGreaterThan(0);
   }, TURN * 2);
 
   test('attaches an image the way a file dropped on the terminal is', async () => {
@@ -357,14 +364,16 @@ describe('headless session', () => {
     const mark = s.log.mark();
     await s.z.send('Use the Agent tool with subagent_type general-purpose and this task: "Reply with exactly: sub-ok". Wait for its result, then reply with exactly what it returned.');
     const call = await s.log.wait('hook', (p) => p.name === 'PreToolUse' && p.tool === 'Agent', mark);
-    const started = await s.log.wait('agent.start', (p) => !p.internal, mark);
-    expect(started.parent_tool_use_id).toBe(call.tool_use_id);
+    // Other agents may run beside it (a person's plugins start their own); this is
+    // the one its tool call started.
+    const started = await s.log.wait('agent.start', (p) => p.parent_tool_use_id === call.tool_use_id, mark);
     expect(started.agent_type).toBe('general-purpose');
     const stopped = await s.log.wait('agent.stop', (p) => p.agent_id === started.agent_id, mark);
     expect(stopped.last_message).toContain('sub-ok');
     const own = s.log.since(mark).filter((e) => e.method === 'entry' && (e.params as any).agent_id === started.agent_id);
     expect(own.some((e: any) => e.params.role === 'assistant' && e.params.text.includes('sub-ok'))).toBe(true);
     expect(own.every((e: any) => e.params.parent_tool_use_id === call.tool_use_id && e.params.sidechain)).toBe(true);
+    expect(own.some((e: any) => e.params.role === 'assistant' && e.params.query_source?.startsWith('agent:'))).toBe(true);
     // Its entries come before its stop.
     const order = s.log.since(mark);
     const stopAt = order.findIndex((e) => e.method === 'agent.stop' && (e.params as any).agent_id === started.agent_id);
@@ -390,14 +399,21 @@ describe('headless session', () => {
     await until(async () => (await s.z.screen()).permission_mode !== undefined, 10_000, 'the tasks view to close');
   }, TURN * 2);
 
-  test('sets the effort level', async () => {
+  test('sets the effort level for this session, saving nothing', async () => {
+    const saved = existsSync(USER_SETTINGS) ? readFileSync(USER_SETTINGS, 'utf8') : null;
     const before = (await s.z.status()).meta.effort;
     expect(before).toBeTruthy();
     const level = before === 'low' ? 'medium' : 'low';
-    expect(await s.z.call('effort.set', { level })).toEqual({ effort: level, status: 'switching' });
-    await until(() => s.store.view.meta.effort === level, 10_000, 'meta to follow');
+    const mark = s.log.mark();
+    expect(await s.z.call('effort.set', { level })).toEqual({ effort: level, status: 'set' });
+    expect(s.store.view.meta.effort).toBe(level);
+    // Claude Code's own status line agrees, and no default was written.
+    await until(() => s.log.since(mark, 'meta').some((e: any) => e.params.effort === level), 10_000, 'meta');
+    expect(existsSync(USER_SETTINGS) ? readFileSync(USER_SETTINGS, 'utf8') : null).toBe(saved);
+    // zclaude's own steps through the picker aren't reported as a question.
+    expect(s.log.since(mark, 'dialog.open')).toHaveLength(0);
     await s.z.call('effort.set', { level: before as any });
-    await until(() => s.store.view.meta.effort === before, 10_000, 'meta to follow back');
+    expect(s.store.view.meta.effort).toBe(before);
   }, 30_000);
 
   test('cycles the permission mode with Shift+Tab', async () => {
@@ -503,6 +519,25 @@ describe('plan mode', () => {
     await until(() => s.store.view.meta.permission_mode === 'acceptEdits', 30_000, 'accept-edits mode');
     await s.log.wait('state', (p) => p.state === 'idle', mark);
   }, TURN * 4);
+
+  test('approves with feedback the way the card does: its field, then Shift+Tab', async () => {
+    await until(() => s.store.view.state === 'idle', TURN, 'idle');
+    expect((await s.z.setMode('plan')).mode).toBe('plan');
+    const mark = s.log.mark();
+    await s.z.send(
+      'Plan this task: create a file named plan-feedback.txt containing the word ok. The plan is a single step; do not explore or ask questions. ' +
+        'Present it with ExitPlanMode right away, then after approval create the file with the Write tool.',
+    );
+    const plan = await s.log.wait('dialog.open', (p) => p.kind === 'plan', mark);
+    const offered = await s.log.wait('dialog.update', (p) => p.id === plan.id && !!p.modes?.length, mark, 15_000);
+    const result = await s.z.respond(plan.id, { decision: 'approve', message: 'Write the word fine instead of ok.' });
+    expect(result).toMatchObject({ status: 'sent', mode: offered.modes![0] });
+    const closed = await s.log.wait('dialog.update', (p) => p.id === plan.id && p.status !== 'open', mark, 30_000);
+    expect(closed).toMatchObject({ status: 'approved', resolved_by: 'rpc' });
+    await until(() => existsSync(join(s.dir, 'plan-feedback.txt')), TURN, 'the planned file');
+    await until(() => readFileSync(join(s.dir, 'plan-feedback.txt'), 'utf8').includes('fine'), 10_000, 'the feedback followed');
+    await s.log.wait('turn.end', () => true, mark);
+  }, TURN * 3);
 });
 
 describe('MCP elicitation', () => {
@@ -526,6 +561,27 @@ describe('MCP elicitation', () => {
     await s.log.wait('entry', (p) => p.origin === 'tool_result' && JSON.stringify(p.blocks).includes('name=Ada'), mark);
     await s.log.wait('state', (p) => p.state === 'idle', mark);
   }, TURN * 2);
+});
+
+describe('status line', () => {
+  test("keeps the person's own status line while reading Claude Code's", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'zclaude-it-'));
+    const settings = { statusLine: { type: 'command', command: 'echo zc-own-status-line' } };
+    const z = ZClaude.spawn({ bin: BIN, cwd: dir, args: ['--model', MODEL, '--settings', JSON.stringify(settings)] });
+    const store = new SessionStore();
+    z.onEvent((event) => store.apply(event));
+    try {
+      await z.ready;
+      await until(() => store.view.state === 'idle', 60_000, 'idle');
+      await until(async () => (await z.screenText()).includes('zc-own-status-line'), 15_000, 'their status line on screen');
+      await until(() => !!store.view.meta.context?.window_tokens, 15_000, "Claude Code's status line data");
+      expect(store.view.meta.cost_usd).toBe(0);
+      expect(store.view.meta.model?.toLowerCase()).toContain('haiku');
+    } finally {
+      await z.shutdown();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 90_000);
 });
 
 describe('API retries', () => {

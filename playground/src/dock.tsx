@@ -263,7 +263,7 @@ function PlanCard({ dialog, active }: CardProps): ReactNode {
   // Until the card is drawn its choices aren't known; approving then keeps the mode
   // the session had before plan mode.
   const modes: Array<PlanMode | undefined> = dialog.modes?.length ? dialog.modes : [undefined];
-  // As on the terminal, feedback can go with an approval too.
+  // As on the terminal, feedback goes with an approval into the card's first choice.
   const approve = (mode?: PlanMode) => send({ decision: 'approve', mode, message });
   const reject = () => send({ decision: 'reject', message });
   useCardKeys(active && !blocked, { enter: () => void approve(modes[0]), escape: () => void reject() });
@@ -283,7 +283,14 @@ function PlanCard({ dialog, active }: CardProps): ReactNode {
       </CardContent>
       <CardFooter className="flex-wrap">
         {modes.map((mode, i) => (
-          <Button key={mode ?? 'approve'} size="sm" variant={i === 0 ? 'default' : 'secondary'} disabled={blocked} onClick={() => void approve(mode)}>
+          <Button
+            key={mode ?? 'approve'}
+            size="sm"
+            variant={i === 0 ? 'default' : 'secondary'}
+            disabled={blocked || (i > 0 && !!message)}
+            title={i > 0 && message ? 'Feedback goes with the first choice, as on the terminal' : undefined}
+            onClick={() => void approve(mode)}
+          >
             {mode ? PLAN_CHOICES[mode] : 'Approve'}
             {i === 0 ? <Kbd>⏎</Kbd> : null}
           </Button>

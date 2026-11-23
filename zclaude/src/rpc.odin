@@ -39,6 +39,9 @@ handle_message :: proc(cl: ^Client, line: string) {
 	case "hook.elicitation":
 		cl.kind = .Hook_Elicitation
 		hub_on_elicitation(cl, id, params)
+	case "hook.status":
+		cl.kind = .Hook_Event
+		hub_on_status(params)
 	case "hook.wait":
 		hub_on_hook_wait(cl, id)
 	case "agent.hello":
@@ -98,9 +101,19 @@ handle_message :: proc(cl: ^Client, line: string) {
 	case "task.stop":
 		if err := hub_stop_task(cl, id, jstr(params, "id")); err != "" do reply_error(cl, id, err)
 	case "effort.set":
-		res, err := rpc_set_effort(jstr(params, "level"))
-		if err != "" do reply_error(cl, id, err)
-		else do reply_result(cl, id, res)
+		// For this session, through the /model picker; `save` also makes it the
+		// default for new sessions, as `/effort LEVEL` does.
+		if jbool(params, "save") {
+			res, err := rpc_set_effort(jstr(params, "level"))
+			if err != "" do reply_error(cl, id, err)
+			else do reply_result(cl, id, res)
+		} else {
+			level := strings.to_lower(strings.trim_space(jstr(params, "level")), context.temp_allocator)
+			known := false
+			for l in EFFORT_LEVELS do if l == level do known = true
+			if !known do reply_error(cl, id, fmt.tprintf("unknown effort %q, expected low, medium, high, xhigh or max", jstr(params, "level")))
+			else if err := hub_set_effort_session(cl, id, level); err != "" do reply_error(cl, id, err)
+		}
 	case "mode.set":
 		if err := hub_set_mode(cl, id, jstr(params, "mode")); err != "" do reply_error(cl, id, err)
 	case "keys":
@@ -511,6 +524,8 @@ respond_on_screen :: proc(d: ^Dialog, params: Value) -> (string, string) {
 	status := option == 0 ? "cancelled" : "answered"
 	dialog_id := strings.clone(d.id, context.temp_allocator)
 	if d.kind != "terminal" {
+		// Claude Code takes the card's answer and drops the held hook.
+		d.rpc_keys = true
 		// A hook dialog closes when Claude Code reports the tool's outcome.
 		return fmt.tprintf(`{{"dialog_id":"%s","status":"sent"}}`, dialog_id), ""
 	}
@@ -524,7 +539,7 @@ rpc_dialog_respond :: proc(params: Value) -> (string, string) {
 	if id == "" do id = jstr(params, "dialog_id")
 	d := find_dialog(id)
 	if d == nil do return "", fmt.tprintf("no open dialog %q", id)
-	if d.kind == "terminal" || (d.hook_client == 0 && jhas(params, "option")) {
+	if d.kind == "terminal" || jhas(params, "option") {
 		return respond_on_screen(d, params)
 	}
 	if d.hook_client == 0 {
@@ -534,7 +549,7 @@ rpc_dialog_respond :: proc(params: Value) -> (string, string) {
 	decision := jstr(params, "decision")
 	message := jstr(params, "message")
 	interrupt := jbool(params, "interrupt")
-	output, status, answers, mode, feedback: string
+	output, status, answers, mode: string
 	switch d.kind {
 	case "question":
 		if decision == "cancel" || decision == "deny" || decision == "decline" {
@@ -610,6 +625,23 @@ rpc_dialog_respond :: proc(params: Value) -> (string, string) {
 				}
 				perms = fmt.tprintf(`[{{"type":"setMode","mode":"%s","destination":"session"}}]`, mode)
 			}
+			// Feedback with an approval exists only on the card: its "Tell Claude what to
+			// change" field, then Shift+Tab, which approves into the card's first choice.
+			// zclaude does exactly that, so Claude reads the feedback with the approval.
+			if message != "" {
+				if jhas(params, "plan") do return "", "send an edited plan or feedback, not both"
+				if len(d.modes) == 0 do return "", "the plan card hasn't shown its choices yet; wait for the dialog.update with modes"
+				if jstr(params, "mode") != "" && jstr(params, "mode") != d.modes[0] {
+					return "", fmt.tprintf("the card approves with feedback into its first choice, %s; approve without a message to choose %s", d.modes[0], jstr(params, "mode"))
+				}
+				menu := screen_menu(app.screen)
+				field := -1
+				for label, i in menu.labels do if strings.contains(strings.to_lower(label, context.temp_allocator), "tell claude") do field = i
+				if field < 0 || !card_in(menu, app.screen) do return "", "the plan card isn't on the terminal screen"
+				if err := answer_card(field + 1, clean_free_text(message), "\x1b[Z"); err != "" do return "", err
+				d.rpc_keys = true
+				return fmt.tprintf(`{{"dialog_id":"%s","status":"sent","mode":"%s"}}`, d.id, d.modes[0]), ""
+			}
 			// Tools that need a person (ExitPlanMode, AskUserQuestion) only take a hook's
 			// allow when it carries the input, which is also how an edited plan goes back.
 			updated := make(Object, context.temp_allocator)
@@ -620,7 +652,6 @@ rpc_dialog_respond :: proc(params: Value) -> (string, string) {
 			}
 			output = decision_json("allow", updated, perms, "", false)
 			status = "approved"
-			feedback = message
 		case "deny", "reject":
 			// The card's "Tell Claude what to change". Without feedback, Claude is told
 			// to keep planning, unless the turn is interrupted too (Esc on the card).
@@ -659,11 +690,6 @@ rpc_dialog_respond :: proc(params: Value) -> (string, string) {
 	jw_str(&w, "dialog_id", dialog_id)
 	jw_str(&w, "status", status)
 	if mode != "" do jw_str(&w, "mode", mode)
-	if feedback != "" {
-		// A hook can't attach feedback to an approval, so it follows as the next
-		// prompt, typed once the card has gone. Claude reads it before going on.
-		if p, err := hub_send_prompt(feedback, "inproc"); err == "" do jw_str(&w, "prompt_id", p.id)
-	}
 	jw_end_obj(&w)
 	return strings.to_string(b), ""
 }

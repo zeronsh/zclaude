@@ -87,7 +87,6 @@ blank_all :: proc(cells: []Cell) {
 	for &c in cells do c = Cell{ch = ' '}
 }
 
-@(private = "file")
 buf :: proc(s: ^Screen) -> []Cell {
 	return s.using_alt ? s.alt : s.main
 }

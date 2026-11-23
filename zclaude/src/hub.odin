@@ -24,6 +24,7 @@ Prompt :: struct {
 	transport: string, // inproc | hook
 	status:    string, // queued | delivered | received | failed
 	command:   bool,   // sent by zclaude itself (model switch), not shown as a prompt
+	claude_id: string, // Claude Code's prompt_id, once UserPromptSubmit has shown it
 	images:    [dynamic]string, // image files attached, pasted as paths ahead of the text
 }
 
@@ -40,6 +41,9 @@ Dialog :: struct {
 	// Plan dialogs: the approve modes the terminal offers, in its order, read from
 	// the screen once the card is drawn. Empty until then.
 	modes:       [dynamic]string,
+	// Answered over RPC by keys on its card: Claude Code then reports it as the
+	// terminal's answer, and zclaude knows better.
+	rpc_keys:    bool,
 }
 
 // After a consumer answers a dialog, Claude Code still has to take the card off the
@@ -169,6 +173,20 @@ Hub :: struct {
 	next_agent:         int,
 	last_retry_attempt: int,
 	task_stop:          ^Task_Stop,
+	effort_task:        ^Effort_Task,
+	// From Claude Code's status line.
+	cost_value:         f64,
+	cost_seen:          bool,
+	status_seq:         int, // status line reports so far
+	sources:            string, // JSON object: which of zclaude's sources are live
+	context_info:       string, // JSON object
+	rate_limits:        string, // JSON object
+	thinking:           bool,
+	fast_mode:          bool,
+	// api-request records: request id to the query that made it (repl_main_thread,
+	// agent:…), newest last, bounded.
+	requests:           map[string]string,
+	request_order:      [dynamic]string,
 }
 
 hub :: proc() -> ^Hub {
@@ -260,6 +278,11 @@ write_meta :: proc(w: ^Jw) {
 	jw_str(w, "effort", h.effort)
 	jw_int(w, "context_tokens", h.context_tokens)
 	jw_raw(w, "cost_usd", h.cost_usd)
+	jw_raw(w, "context", h.context_info != "" ? h.context_info : "null")
+	jw_raw(w, "rate_limits", h.rate_limits != "" ? h.rate_limits : "null")
+	jw_raw(w, "sources", h.sources != "" ? h.sources : "{}")
+	jw_bool(w, "thinking", h.thinking)
+	jw_bool(w, "fast_mode", h.fast_mode)
 	jw_end_obj(w)
 }
 
@@ -380,7 +403,6 @@ snapshot_json :: proc() -> string {
 // ---------- Hooks ----------
 
 // Fields every hook carries. Subagent hooks describe the subagent, not the session.
-@(private = "file")
 hook_common :: proc(params: Value) {
 	h := hub()
 	if jhas(params, "agent_id") do return
@@ -423,6 +445,7 @@ hub_on_hook_event :: proc(params: Value) {
 	event_send(ev)
 
 	update_dialogs(name, tool, params)
+	if name == "UserPromptSubmit" && !jhas(params, "agent_id") do bind_prompt(jstr(params, "prompt"), jstr(params, "prompt_id"))
 	track_turn(name, tool, params)
 	if name == "UserPromptSubmit" do h.prompt_submitted = true
 	if name == "PostModelSwitch" {
@@ -505,7 +528,9 @@ update_dialogs :: proc(name, tool: string, params: Value) {
 			}
 		}
 		if st, ok := h.settle.?; ok && (st.id == id || (strings.has_prefix(st.id, "perm-") && st.tool == tool)) do settle_end()
-		status := name == "PermissionDenied" ? "denied" : tool == "AskUserQuestion" ? "answered" : "allowed"
+		denied := name == "PermissionDenied"
+		status := denied ? "denied" : tool == "AskUserQuestion" ? "answered" : tool == "ExitPlanMode" ? "approved" : "allowed"
+		if denied && tool == "ExitPlanMode" do status = "rejected"
 		answers := ""
 		if name == "PostToolUse" && tool == "AskUserQuestion" {
 			if a := jget(params, "tool_input", "answers"); a != nil do answers = to_json(a, context.temp_allocator)
@@ -678,6 +703,8 @@ release_hook :: proc(d: ^Dialog, output: string) {
 
 close_dialog :: proc(d: ^Dialog, status, resolved_by: string, answers: string, output := "") {
 	h := hub()
+	resolved_by := resolved_by
+	if d.rpc_keys && resolved_by == "terminal" do resolved_by = "rpc"
 	// Only a released hook leaves a card that Claude Code still has to take down.
 	if resolved_by == "rpc" && d.hook_client != 0 && output != "" do settle_begin(d)
 	release_hook(d, output)
@@ -858,7 +885,7 @@ skip_record :: proc(line: string) -> bool {
 	end := strings.index_byte(rest, '"')
 	if end < 0 do return false
 	switch rest[:end] {
-	case "user", "assistant", "system", "attachment", "cost-state", "repl-mode":
+	case "user", "assistant", "system", "attachment", "cost-state", "repl-mode", "api-request":
 		return false
 	}
 	return true
@@ -882,6 +909,10 @@ handle_transcript_line :: proc(line: string, historic: bool) {
 		return
 	}
 	// Records that aren't conversation, found cheaply before any parse.
+	if strings.has_prefix(line, `{"type":"api-request"`) {
+		if v, ok := parse_json(line); ok do note_request(jstr(v, "id"), jstr(v, "querySource"))
+		return
+	}
 	if strings.contains(line, `"cost-state"`) {
 		if v, ok := parse_json(line); ok && jstr(v, "type") == "cost-state" {
 			#partial switch cost in jget(v, "totalCostUSD") {
@@ -913,6 +944,10 @@ handle_transcript_line :: proc(line: string, historic: bool) {
 @(private = "file")
 handle_agent_line :: proc(line: string, a: ^Subagent) {
 	h := hub()
+	if strings.has_prefix(line, `{"type":"api-request"`) {
+		if v, ok := parse_json(line); ok do note_request(jstr(v, "id"), jstr(v, "querySource"))
+		return
+	}
 	entry, ok := parse_line(line)
 	if !ok || entry.uuid in h.seen do return
 	h.seen[strings.clone(entry.uuid)] = true
@@ -982,16 +1017,28 @@ publish_entry :: proc(entry: ^Entry, historic: bool) {
 			ev := event("stream.confirmed")
 			jw_int(&ev.w, "stream", i64(n))
 			jw_str(&ev.w, "message_id", entry.message_id)
+			// The record of the request settles which conversation it belonged to.
+			if source, known := h.requests[entry.request_ref]; known {
+				main := is_main_query(source)
+				jw_bool(&ev.w, "main", main)
+				jw_str(&ev.w, "query_source", source)
+				if s, live := h.streams[n]; live do s.main = main
+			}
 			event_send(ev)
 		}
 	}
 	prompt_id := ""
 	if !historic {
 		if entry.origin == "notification" || entry.origin == "terminal" {
+			// By Claude Code's prompt_id when UserPromptSubmit bound it, else by text:
+			// prompts queued mid-turn and the rewake hook's come in without that id.
+			match := -1
+			for p, i in h.in_flight do if match < 0 && p.claude_id != "" && p.claude_id == entry.prompt_ref do match = i
+			for p, i in h.in_flight do if match < 0 && prompt_matches(p.text, entry.text) do match = i
 			for p, i in h.in_flight {
-				if prompt_matches(p.text, entry.text) {
+				if i == match {
 					prompt_id = strings.clone(p.id, context.temp_allocator)
-					if !entry.sidechain do turn_took_prompt(p.id)
+					if !entry.sidechain do turn_took_prompt(p.id, entry.prompt_ref)
 					prompt_status(p, "received")
 					ordered_remove(&h.in_flight, i)
 					prompt_free(p)
@@ -1021,8 +1068,9 @@ publish_entry :: proc(entry: ^Entry, historic: bool) {
 			if !entry.sidechain do turn_end_begin("interrupted")
 			set_state("idle")
 		case "terminal", "external", "notification":
-			if !entry.sidechain {
-				turn_begin()
+			// A line of the turn in progress (by Claude Code's prompt id) isn't a new one.
+			if !entry.sidechain && !in_current_turn(entry.prompt_ref) {
+				turn_begin(entry.prompt_ref)
 				set_state("busy")
 			}
 		}
@@ -1042,6 +1090,8 @@ emit_entry :: proc(entry: ^Entry, prompt_id: string, historic: bool, only: ^Clie
 	if entry.model != "" do jw_str(&ev.w, "model", entry.model)
 	if entry.message_id != "" do jw_str(&ev.w, "message_id", entry.message_id)
 	if prompt_id != "" do jw_str(&ev.w, "prompt_id", prompt_id)
+	if entry.prompt_ref != "" do jw_str(&ev.w, "claude_prompt_id", entry.prompt_ref)
+	if source, known := hub().requests[entry.request_ref]; known do jw_str(&ev.w, "query_source", source)
 	jw_bool(&ev.w, "sidechain", entry.sidechain)
 	if agent != nil {
 		jw_str(&ev.w, "agent_id", agent.id)
@@ -1126,6 +1176,7 @@ command_matches :: proc(sent, seen: string) -> bool {
 }
 
 prompt_free :: proc(p: ^Prompt) {
+	delete(p.claude_id)
 	for i in p.images do delete(i)
 	delete(p.images)
 	delete(p.id)
@@ -1199,7 +1250,13 @@ hub_send_prompt :: proc(text, transport: string, command := false, images: []str
 
 can_type_prompt :: proc() -> bool {
 	h := hub()
-	return h.session_started && len(h.dialogs) == 0 && h.state != "awaiting_input" && h.mode_task == nil && !app.child_exited && app.shutdown.stage == .None && !settling() && !card_on_screen(app.screen)
+	return h.session_started && len(h.dialogs) == 0 && h.state != "awaiting_input" && h.mode_task == nil && !app.child_exited && app.shutdown.stage == .None && !settling() && !card_on_screen(app.screen) && !draft_in_the_way()
+}
+
+// A draft in the prompt box holds zclaude's typing until it is sent or cleared. A
+// draft zclaude typed itself (a prompt waiting for its Enter) holds the next one too.
+draft_in_the_way :: proc() -> bool {
+	return composer_draft(app.screen)
 }
 
 flush_inproc_queue :: proc() {
@@ -1577,6 +1634,8 @@ hub_on_timer :: proc(t: Timer) {
 		agent_drain(t.n)
 	case .Task_Step:
 		task_stop_step()
+	case .Effort_Step:
+		effort_step()
 	case .Memory_Timeout:
 		if req, has := h.memory_requests[t.n]; has {
 			delete_key(&h.memory_requests, t.n)
@@ -1593,6 +1652,10 @@ hub_on_screen_change :: proc() {
 hub_after_tick :: proc() {
 	h := hub()
 	flush_inproc_queue()
+	// Which sources are live: Claude Code's hooks, the agent inside its process, its
+	// status line and its transcript. A consumer sees at once if one has stopped.
+	sources := fmt.tprintf(`{{"hooks":%v,"agent":%v,"status_line":%v,"transcript":%v}}`, h.session_started, h.agent_client != 0, h.status_seq > 0, h.tail.has_fd)
+	if sources != h.sources do set_meta_raw("sources", &h.sources, sources)
 	if h.screen_dirty && now_ms() - h.screen_checked_at >= SCREEN_CHECK_MS {
 		h.screen_dirty = false
 		h.screen_checked_at = now_ms()
@@ -1636,7 +1699,8 @@ sync_terminal_card :: proc() {
 		if term != nil do close_dialog(term, "closed", "terminal", "")
 		return
 	}
-	if hooked || settling() {
+	// zclaude's own steps through a menu (effort, tasks) aren't questions for anyone.
+	if hooked || settling() || h.effort_task != nil || h.task_stop != nil {
 		h.card_since = 0
 		if term != nil do close_dialog(term, "closed", "", "")
 		return
@@ -1711,7 +1775,7 @@ is_rule :: proc(line: string) -> bool {
 
 // Answers whatever card is on screen by its choice number, the way a person
 // would: arrows to the choice, any text into its field, then Enter. `0` is Esc.
-answer_card :: proc(option: int, text: string) -> string {
+answer_card :: proc(option: int, text: string, final := "\r") -> string {
 	menu := screen_menu(app.screen)
 	if !card_in(menu, app.screen) do return "no card is on the terminal screen"
 	if option < 0 || option > len(menu.labels) do return fmt.tprintf("option must be 1 to %d, or 0 for Esc", len(menu.labels))
@@ -1723,7 +1787,7 @@ answer_card :: proc(option: int, text: string) -> string {
 		key, _ := key_bytes(delta < 0 ? "up" : "down")
 		for _ in 0 ..< abs(delta) do append(&steps, key)
 		if text != "" do append(&steps, fmt.tprintf("\x1b[200~%s\x1b[201~", text))
-		append(&steps, "\r")
+		append(&steps, final)
 	}
 	for step, i in steps {
 		if i == 0 do pty_write(transmute([]u8)step)
@@ -1943,6 +2007,14 @@ shutdown_step :: proc() {
 		// Claude Code takes a moment to wind a turn down after Esc.
 		if now - sd.esc_at < 400 do return
 	}
+	// A view over the prompt box (/tasks, a picker) would swallow /exit: Esc first.
+	if !prompt_box_visible() {
+		if now - sd.esc_at > 500 {
+			send_input(input_route(), transmute([]u8)string("\x1b"))
+			sd.esc_at = now
+		}
+		return
+	}
 	// Typed once, and again if the first was swallowed (by a menu, say).
 	if sd.exits == 0 || (sd.exits == 1 && now - sd.exit_at > 2500) {
 		route := input_route()
@@ -2011,7 +2083,9 @@ detect_mode :: proc(s: ^Screen) -> (string, bool) {
 		for ind in INDICATORS do if strings.contains(compact, ind[0]) do return ind[1], true
 		// Older builds show only the hint in the default mode.
 		if strings.contains(compact, "?forshortcuts") do return "default", true
-		if strings.contains(compact, "shift+tab") {
+		// The footer's hint is "(shift+tab to cycle)"; a card's "shift+tab to approve
+		// with this feedback" isn't a footer.
+		if strings.contains(compact, "shift+tabtocycle") {
 			switch {
 			case strings.contains(compact, "acceptedits"): return "acceptEdits", true
 			case strings.contains(compact, "planmode"): return "plan", true

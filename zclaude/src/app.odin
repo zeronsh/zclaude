@@ -57,6 +57,7 @@ Timer_Kind :: enum {
 	Turn_End,    // a stopped turn's end marker didn't come in time
 	Agent_Drain, // a finished subagent's transcript has had time to be written
 	Task_Step,   // one step of stopping a background task through /tasks
+	Effort_Step, // one step of setting the effort through the /model picker
 }
 
 Input_Route :: enum {

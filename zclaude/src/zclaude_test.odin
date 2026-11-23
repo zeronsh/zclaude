@@ -500,7 +500,7 @@ plan_approval_sets_the_mode_and_interrupt_refuses_held_dialogs :: proc(t: ^testi
 	bypass, _ := parse_json(`{"id":"p1","decision":"approve","mode":"bypassPermissions"}`)
 	_, berr := rpc_dialog_respond(bypass)
 	testing.expect(t, berr != "")
-	approve, _ := parse_json(`{"id":"p1","decision":"approve","mode":"acceptEdits","plan":"y","message":"also add tests"}`)
+	approve, _ := parse_json(`{"id":"p1","decision":"approve","mode":"acceptEdits","plan":"y"}`)
 	res, err := rpc_dialog_respond(approve)
 	testing.expect_value(t, err, "")
 	output, _ := parse_json(jstr(drain(hook)[0], "result", "output"))
@@ -510,11 +510,8 @@ plan_approval_sets_the_mode_and_interrupt_refuses_held_dialogs :: proc(t: ^testi
 	// ExitPlanMode needs a person, so Claude Code only takes an allow that carries the
 	// input. An edited plan goes back the same way.
 	testing.expect_value(t, jstr(output, "hookSpecificOutput", "decision", "updatedInput", "plan"), "y")
-	// Feedback follows as a prompt, once the card has gone.
 	reply, _ := parse_json(res)
 	testing.expect_value(t, jstr(reply, "mode"), "acceptEdits")
-	testing.expect(t, jstr(reply, "prompt_id") != "")
-	testing.expect_value(t, hub().inproc_queue[0].text, "also add tests")
 
 	hook2 := capture(subscribed = false)
 	hook_event(`{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"b2","tool_input":{"command":"rm x"}}`)
@@ -629,6 +626,11 @@ shutdown_ends_the_turn_then_types_exit_then_hangs_up :: proc(t: ^testing.T) {
 	testing.expect_value(t, app.shutdown.exits, 0)
 	app.shutdown.esc_at -= 1000
 	hook_event(`{"hook_event_name":"Stop"}`)
+	// /exit goes only into a visible prompt box.
+	shutdown_step()
+	testing.expect_value(t, app.shutdown.exits, 0)
+	screen_feed(app.screen, transmute([]u8)string("\x1b[24;1H  ? for shortcuts"))
+	app.shutdown.esc_at -= 1000
 	shutdown_step()
 	testing.expect_value(t, app.shutdown.exits, 1)
 	// Prompts are refused rather than typed into a closing session.
@@ -1008,10 +1010,23 @@ subagents_link_to_their_tool_call_and_forward_their_transcript :: proc(t: ^testi
 	hook_event(`{"hook_event_name":"PreToolUse","tool_name":"Agent","tool_use_id":"tA","tool_input":{"prompt":"x","subagent_type":"Explore"}}`)
 	hook_event(`{"hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Explore"}`)
 	hook_event(`{"hook_event_name":"SubagentStart","agent_id":"h1","agent_type":""}`)
+	// A plugin's agent of the same type, with no tool call behind it, claims nothing.
+	hook_event(`{"hook_event_name":"SubagentStart","agent_id":"p1","agent_type":"Explore"}`)
 	started := events_of(drain(cap), "agent.start")
-	testing.expect_value(t, len(started), 2)
-	testing.expect_value(t, jstr(started[0], "parent_tool_use_id"), "tA")
-	testing.expect(t, jbool(started[1], "internal"))
+	testing.expect_value(t, len(started), 1) // only the internal one: the others wait for their metadata
+	testing.expect(t, jbool(started[0], "internal"))
+	// Claude Code's metadata file names the call.
+	_ = os.write_entire_file(fmt.tprintf("%s/subagents/agent-a1.meta.json", base), transmute([]u8)string(`{"toolUseId":"tA"}`))
+	hub_poll_transcript()
+	named := events_of(drain(cap), "agent.start")
+	testing.expect_value(t, len(named), 1)
+	testing.expect_value(t, jstr(named[0], "agent_id"), "a1")
+	testing.expect_value(t, jstr(named[0], "parent_tool_use_id"), "tA")
+	find_agent("p1").started_tick -= AGENT_PARENT_WAIT_MS
+	hub_poll_transcript()
+	plain := events_of(drain(cap), "agent.start")
+	testing.expect_value(t, jstr(plain[0], "agent_id"), "p1")
+	testing.expect(t, !jhas(plain[0], "parent_tool_use_id"))
 	append_file(sub, `{"type":"assistant","uuid":"s1","isSidechain":true,"message":{"id":"sm1","content":[{"type":"text","text":"found it"}]}}` + "\n")
 	hub_poll_transcript()
 	entry := events_of(drain(cap), "entry")[0]
@@ -1030,7 +1045,7 @@ subagents_link_to_their_tool_call_and_forward_their_transcript :: proc(t: ^testi
 	testing.expect_value(t, jstr(events_of(msgs, "entry")[0], "text"), "done")
 	stopped := events_of(msgs, "agent.stop")[0]
 	testing.expect_value(t, jstr(stopped, "last_message"), "found it")
-	testing.expect_value(t, len(hub().agents), 1)
+	testing.expect_value(t, len(hub().agents), 2)
 }
 
 @(test)
@@ -1075,9 +1090,169 @@ the_tasks_view_is_read_for_stopping_a_task :: proc(t: ^testing.T) {
 	testing.expect_value(t, v.cursor, 0)
 	testing.expect_value(t, v.target, 1)
 	screen_feed(app.screen, transmute([]u8)string("\x1b[2J\x1b[12;1H▔▔▔▔▔▔▔▔▔▔▔▔\r\n  Sleep 301 seconds in background\r\n  Command:  sleep 301\r\n  ← to go back · x to stop · Enter/Space to close · Esc to close\r\n"))
+	// macOS draws the bullets as ⏺.
+	screen_feed(app.screen, transmute([]u8)string("\x1b[2J\x1b[12;1H\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\r\n  Background\r\n  \u276f \u23fa sleep 302   running\r\n    \u23fa sleep 301   running\r\n  \u2191/\u2193 to navigate \u00b7 x to stop \u00b7 Esc to close\r\n"))
+	m := tasks_view(app.screen, labels)
+	testing.expect_value(t, m.cursor, 0)
+	testing.expect_value(t, m.target, 1)
+	screen_feed(app.screen, transmute([]u8)string("\x1b[2J\x1b[12;1H\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\u2594\r\n  Sleep 301 seconds in background\r\n  Command:  sleep 301\r\n  \u2190 to go back \u00b7 x to stop \u00b7 Enter/Space to close \u00b7 Esc to close\r\n"))
 	d := tasks_view(app.screen, labels)
 	testing.expect(t, d.open && d.detail)
 	testing.expect_value(t, d.target, 0)
 	screen_feed(app.screen, transmute([]u8)string("\x1b[2J\x1b[22;1H❯ \x1b[24;1H  ? for shortcuts"))
 	testing.expect(t, !tasks_view(app.screen, labels).open)
+}
+
+@(test)
+the_status_line_gives_cost_context_limits_and_exact_turn_cost :: proc(t: ^testing.T) {
+	reset_app()
+	cap := capture()
+	hook_event(`{"hook_event_name":"SessionStart"}`)
+	status :: proc(cost: string) {
+		v, _ := parse_json(fmt.tprintf(`{{"permission_mode":"acceptEdits","cost":{{"total_cost_usd":%s}},"context_window":{{"context_window_size":200000,"used_percentage":12,"total_input_tokens":24000,"total_output_tokens":10}},"rate_limits":{{"five_hour":{{"used_percentage":30,"resets_at":1795}}}},"effort":{{"level":"high"}},"model":{{"id":"claude-haiku-5-5"}},"thinking":{{"enabled":true}}}}`, cost))
+		hub_on_status(v)
+	}
+	status("0.5")
+	testing.expect_value(t, hub().cost_usd, "0.500000")
+	testing.expect_value(t, hub().permission_mode, "acceptEdits")
+	testing.expect_value(t, hub().effort, "high")
+	testing.expect(t, strings.contains(hub().context_info, `"window_tokens":200000`))
+	testing.expect(t, strings.contains(hub().rate_limits, `"five_hour"`))
+	// A turn's cost is the difference, taken after the status line has reported on
+	// its last message.
+	hook_event(`{"hook_event_name":"UserPromptSubmit","prompt_id":"c1"}`)
+	stream_event(`{"stream":1,"type":"message_start","message_id":"m1","in_thread":true}`)
+	stream_event(`{"stream":1,"type":"message_stop"}`)
+	hook_event(`{"hook_event_name":"Stop"}`)
+	turn_marker(10)
+	testing.expect(t, hub().turn != nil && hub().turn.awaiting_status)
+	status("0.75")
+	end := events_of(drain(cap), "turn.end")[0]
+	testing.expect_value(t, to_json(jget(end, "cost_usd"), context.temp_allocator), "0.25")
+}
+
+@(test)
+prompts_and_requests_are_linked_by_claude_codes_own_ids :: proc(t: ^testing.T) {
+	reset_app()
+	cap := capture()
+	path := temp_transcript("ids")
+	hook_event(fmt.tprintf(`{{"hook_event_name":"SessionStart","transcript_path":"%s"}}`, path))
+	p, _ := hub_send_prompt("hello there", "inproc")
+	hook_event(`{"hook_event_name":"UserPromptSubmit","prompt":"hello there","prompt_id":"cp9"}`)
+	testing.expect_value(t, p.claude_id, "cp9")
+	stream_event(`{"stream":1,"type":"message_start","message_id":"m1","in_thread":false}`)
+	// The user line is matched by id, whatever its text became.
+	append_file(path, `{"type":"user","uuid":"u1","promptId":"cp9","message":{"content":"[Pasted text #1]"}}` + "\n")
+	append_file(path, `{"type":"api-request","id":"r1","querySource":"repl_main_thread"}` + "\n")
+	append_file(path, `{"type":"assistant","uuid":"u2","requestRef":"r1","message":{"id":"m1","content":[{"type":"text","text":"hi"}]}}` + "\n")
+	hub_poll_transcript()
+	msgs := drain(cap)
+	entries := events_of(msgs, "entry")
+	testing.expect_value(t, jstr(entries[0], "prompt_id"), p.id)
+	testing.expect_value(t, jstr(entries[0], "claude_prompt_id"), "cp9")
+	testing.expect_value(t, jstr(entries[1], "query_source"), "repl_main_thread")
+	confirmed := events_of(msgs, "stream.confirmed")[0]
+	testing.expect(t, jbool(confirmed, "main"))
+	testing.expect(t, is_main_query("repl_main_thread:compact") && !is_main_query("agent:builtin:Explore"))
+}
+
+@(test)
+the_status_line_setting_wraps_the_persons_own :: proc(t: ^testing.T) {
+	s, err := build_settings("/z", "/s.sock", `{"statusLine":{"type":"command","command":"echo mine","padding":2}}`)
+	testing.expect_value(t, err, "")
+	v, _ := parse_json(s)
+	line := jget(v, "statusLine")
+	testing.expect(t, strings.has_prefix(jstr(line, "command"), "'/z' __hook status '/s.sock' "))
+	padding, _ := jint(line, "padding")
+	testing.expect_value(t, padding, 2)
+}
+
+@(test)
+plan_feedback_goes_through_the_cards_own_field :: proc(t: ^testing.T) {
+	reset_app()
+	hook := capture(subscribed = false)
+	hook_event(`{"hook_event_name":"PreToolUse","tool_name":"ExitPlanMode","tool_use_id":"p1","tool_input":{"plan":"x"}}`)
+	req, _ := parse_json(`{"hook_event_name":"PermissionRequest","tool_name":"ExitPlanMode","tool_input":{"plan":"x"}}`)
+	hub_on_permission_request(hook.cl, "1", req)
+	screen_feed(app.screen, transmute([]u8)string("Would you like to proceed?\r\n \u276f 1. Yes, and use auto mode\r\n   2. Yes, manually approve edits\r\n   3. Tell Claude what to change\r\n      shift+tab to approve with this feedback\r\n   ctrl+g to edit in Vim\r\n"))
+	hub().screen_dirty = true
+	hub_after_tick()
+	// The card's own Shift+Tab hint is not the prompt box's footer.
+	testing.expect(t, card_on_screen(app.screen))
+	// Shift+Tab approves feedback into the card's first choice; another can't have it.
+	wrong, _ := parse_json(`{"id":"p1","decision":"approve","mode":"default","message":"use fine"}`)
+	_, werr := rpc_dialog_respond(wrong)
+	testing.expect(t, strings.contains(werr, "first choice, auto"))
+	right, _ := parse_json(`{"id":"p1","decision":"approve","message":"use fine"}`)
+	res, err := rpc_dialog_respond(right)
+	testing.expect_value(t, err, "")
+	testing.expect(t, strings.contains(res, `"sent"`) && strings.contains(res, `"auto"`))
+	keys := make([dynamic]string, context.temp_allocator)
+	for tm in app.timers do if tm.kind == .Input do append(&keys, tm.data)
+	testing.expect_value(t, keys[len(keys) - 1], "\x1b[Z")
+	testing.expect(t, strings.contains(keys[len(keys) - 2], "use fine"))
+	// The hook isn't answered: Claude Code takes the card's answer.
+	testing.expect_value(t, len(drain(hook)), 0)
+	testing.expect(t, hub().dialogs[0].rpc_keys)
+	cap := capture()
+	hook_event(`{"hook_event_name":"PostToolUse","tool_name":"ExitPlanMode","tool_use_id":"p1"}`)
+	closed := events_of(drain(cap), "dialog.update")[0]
+	testing.expect_value(t, jstr(closed, "status"), "approved")
+	testing.expect_value(t, jstr(closed, "resolved_by"), "rpc")
+}
+
+@(test)
+a_draft_in_the_prompt_box_holds_typing :: proc(t: ^testing.T) {
+	reset_app()
+	hook_event(`{"hook_event_name":"SessionStart"}`)
+	box :: proc(content: string) {
+		rule := strings.repeat("─", 40, context.temp_allocator)
+		// The conversation above echoes an earlier prompt with the same glyph, and the
+		// upper rule can carry the session's name.
+		screen_feed(app.screen, transmute([]u8)fmt.tprintf("\x1b[2J\x1b[14;1H%s\r\n❯ an earlier prompt\r\n\x1b[20;1H%s fix-it ──\r\n\x1b[0m❯ %s\x1b[0m\r\n%s\r\n  ? for shortcuts", rule, rule, content, rule))
+	}
+	// The dim placeholder Claude Code shows in an empty box is not a draft.
+	box("\x1b[0;2mTry \"refactor <filepath>\"")
+	testing.expect(t, !composer_draft(app.screen))
+	box("\u00a0") // how Claude Code draws an empty box
+	testing.expect(t, !composer_draft(app.screen))
+	p, _ := hub_send_prompt("hello", "inproc")
+	testing.expect_value(t, p.status, "delivered")
+	box("half a thought")
+	testing.expect(t, composer_draft(app.screen))
+	q, _ := hub_send_prompt("later", "inproc")
+	testing.expect_value(t, q.status, "queued")
+	box("")
+	flush_inproc_queue()
+	testing.expect_value(t, q.status, "delivered")
+}
+
+@(test)
+a_failed_turns_late_lines_stay_in_it :: proc(t: ^testing.T) {
+	reset_app()
+	cap := capture()
+	path := temp_transcript("failed")
+	hook_event(fmt.tprintf(`{{"hook_event_name":"SessionStart","transcript_path":"%s"}}`, path))
+	p, _ := hub_send_prompt("hi", "inproc")
+	hook_event(`{"hook_event_name":"UserPromptSubmit","prompt":"hi","prompt_id":"cpx"}`)
+	hook_event(`{"hook_event_name":"StopFailure","error":"authentication_failed"}`)
+	// Claude Code writes the prompt and the error after StopFailure.
+	append_file(path, `{"type":"user","uuid":"u1","promptId":"cpx","message":{"content":"hi"}}` + "\n")
+	append_file(path, `{"type":"assistant","uuid":"u2","message":{"id":"m","content":[{"type":"text","text":"Please run /login"}]}}` + "\n")
+	hub_poll_transcript()
+	turn_timer(hub().turn.n)
+	msgs := drain(cap)
+	testing.expect_value(t, len(events_of(msgs, "turn.start")), 1)
+	ends := events_of(msgs, "turn.end")
+	testing.expect_value(t, len(ends), 1)
+	testing.expect_value(t, jstr(ends[0], "status"), "error")
+	testing.expect_value(t, jstr(jarr(ends[0], "prompt_ids")[0]), p.id)
+	order := make([dynamic]string, context.temp_allocator)
+	for m in msgs do append(&order, jstr(m, "method"))
+	last_entry, end_at := -1, -1
+	for m, i in order {
+		if m == "entry" do last_entry = i
+		if m == "turn.end" do end_at = i
+	}
+	testing.expect(t, last_entry < end_at)
 }

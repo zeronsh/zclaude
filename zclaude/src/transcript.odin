@@ -30,6 +30,10 @@ Entry :: struct {
 	// The API message id, which links an assistant entry to its live stream.
 	message_id: string,
 	sidechain:  bool,
+	// Claude Code's own links: the prompt a user line belongs to, and the API request
+	// (an `api-request` record) an assistant line came from.
+	prompt_ref:  string,
+	request_ref: string,
 }
 
 parse_line :: proc(line: string) -> (e: Entry, ok: bool) {
@@ -60,6 +64,8 @@ parse_line :: proc(line: string) -> (e: Entry, ok: bool) {
 		blocks     = to_json(parsed.blocks, context.temp_allocator),
 		model      = parsed.model,
 		message_id = kind == "assistant" ? jstr(v, "message", "id") : "",
+		prompt_ref = jstr(v, "promptId"),
+		request_ref = jstr(v, "requestRef"),
 		sidechain  = jbool(v, "isSidechain"),
 	}
 	return e, true

@@ -82,7 +82,7 @@ main :: proc() {
 	if len(args) >= 1 && args[0] == "__hook" {
 		mode := len(args) > 1 ? args[1] : ""
 		socket := len(args) > 2 ? args[2] : ""
-		os.exit(run_hook(mode, socket))
+		os.exit(run_hook(mode, socket, len(args) > 3 ? args[3] : ""))
 	}
 	if len(args) >= 1 && args[0] == "__session" {
 		os.exit(run_session(args[1:]))
